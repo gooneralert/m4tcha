@@ -1,0 +1,1942 @@
+-- Activate Matcha Input Injection
+pcall(function()
+    setrobloxinput(true)
+end)
+
+-- Wait for LocalPlayer to load to prevent "attempt to index nil with 'Name'"
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+while not player do
+    wait(0.1) -- Swapped task.wait with global wait
+    player = Players.LocalPlayer
+end
+
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
+-- Run Always-On Anti-Fall Damage on Startup
+pcall(function()
+    local val = 999999999
+    local NFD = "NoRagdollNoFallDamage"
+    for _, v in ipairs(Workspace:GetChildren()) do
+        if v.Name == NFD then
+            v.Size = Vector3.new(val, val, val)
+        end
+    end
+    print("Anti-Fall Damage: ON")
+end)
+
+-- Load the INS UI Library (Defensively handled for Matcha's top-level return drop)
+pcall(function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))()
+end)
+local Lib = INSui or _G.INSui
+
+-- Clean Global State Encapsulation (Wipes old tables on startup to prevent cached field mismatches)
+_G.CarFlyState = {
+    enabled = false,
+    useTaser = false, -- Taser toggle
+    carSpeed = 410,
+    playerSpeedHorizontal = 110,
+    playerSpeedVertical = 100,
+    flyHeight = 250,
+    targetPlayer = nil,
+    
+    -- UI Labels stored globally to prevent definition scoping/order crashes
+    statusLabel = nil,
+    targetLabel = nil,
+    flyToggle = nil,
+    
+    -- Flight Phases
+    ascended = false,
+    aligned = false,
+    isArresting = false,
+    holdingE = false,
+    
+    -- Return phases
+    isReturningToCar = false,
+    returnAscended = false,
+    returnAligned = false,
+    lastETapTime = 0,
+    isCheckingGarage = false,
+    onFootMaxRange = 50,
+    inCarMaxRange = 3500, -- Default Pursuit Limit initialized to 3500 studs
+    
+    -- Death recovery tracking
+    isDeadState = false,
+    respawnRoutingActive = false,
+    needsRespawnSequence = false,
+    deathRouteWaypoints = {},
+    deathRouteIndex = 1,
+    deathRouteAction = "spawn",
+    skipGarageCheck = false,
+    isWaitingAtWaypoint = false, -- Controls transition pause at each node
+    waypointReachedTime = 0, -- Timestamps waypoint touch moment
+    respawnTime = 0, -- Prevents race conditions during teleportation loads
+    
+    -- Glitched vehicle bypass memory
+    seatEntryStart = 0,
+    sittingTargetVehicle = nil,
+    blacklistedVehicles = {},
+    
+    -- Bounty Board Data
+    prioritizeBounty = false,
+    scrapedBounties = {},
+    
+    -- Taser Aim Controls
+    isAimingTaser = false,
+    
+    -- Caching
+    cachedCar = nil,
+    cachedRoot = nil,
+    nextCarSearch = 0,
+    
+    -- Safety
+    blacklistedPlayers = {},
+    lastPosCheck = 0,
+    lastCheckedPos = nil,
+    lastGarageDebugTime = 0,
+    lastAttributePrintTime = 0, -- Diagnostics timer
+    lastSpaceDoubleTap = 0, -- Keeps track of parachute click pacing
+    lastCarOccupationCheck = 0, -- Monitors vehicle seating status during chase
+    verticalStuckStart = 0, -- Tracks vertical ceiling/roof obstructions
+    arrestPhaseStart = 0, -- Grace timer tracking for on-foot arrests
+    maxTargetSpeedStuds = 80, -- Maximum target velocity in studs/s
+    
+    -- Cooldown memory
+    garageCooldownExpiry = 0, -- Remembers lock time to prevent unneeded panel openings
+    
+    -- Target Relative stuck-tracking variables
+    lastDistanceToTarget = 999999999,
+    lastDistanceCheckTime = 0
+}
+
+local S = _G.CarFlyState
+
+-- Anchoring all Helper Functions directly in standard environmental GLOBALS to prevent VM stack sweepers from clearing them
+function getPath(parent, ...)
+    local current = parent
+    for _, name in ipairs({...}) do
+        if not current then return nil end
+        current = current:FindFirstChild(name)
+    end
+    return current
+end
+
+function clickMouse()
+    pcall(mouse1press)
+    wait(0.12)
+    pcall(mouse1release)
+end
+
+function tapKey(keycode)
+    pcall(keypress, keycode)
+    wait(0.12)
+    pcall(keyrelease, keycode)
+end
+
+-- Smart Equipment Manager: Checks Hotbar item sizes to precisely equip necessary tools
+function equipTool(slotIndex)
+    local targetStr = tostring(slotIndex)
+    local vKey = 0x30 + tonumber(slotIndex) -- Virtual Key Code for numbers (0x31 = 1, 0x32 = 2...)
+    
+    for attempt = 1, 3 do
+        local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+        local container = playerGui and getPath(playerGui, "HotbarGui", "Container")
+        
+        if not container then
+            tapKey(vKey)
+            wait(0.3)
+            return false
+        end
+        
+        local items = {}
+        local maxArea = 0
+        local minArea = 999999999
+        
+        -- Safely map only valid "Item" objects
+        for _, child in ipairs(container:GetChildren()) do
+            if child.Name == "Item" then
+                local success, size = pcall(function() return child.AbsoluteSize end)
+                if success and size then
+                    local sx = tonumber(size.X) or 0
+                    local sy = tonumber(size.Y) or 0
+                    local area = sx * sy
+                    
+                    if area > 0 then
+                        local btn = child:FindFirstChild("Button")
+                        local idxObj = btn and btn:FindFirstChild("Index")
+                        local itemIndex = "None"
+                        
+                        if idxObj then
+                            local tSuccess, tVal = pcall(function() return idxObj.Text end)
+                            if tSuccess and tVal then
+                                itemIndex = tostring(tVal):match("%d+") or "None"
+                            end
+                        end
+                        
+                        table.insert(items, {area = area, index = itemIndex})
+                        if area > maxArea then maxArea = area end
+                        if area < minArea then minArea = area end
+                    end
+                end
+            end
+        end
+        
+        local activeIndex = "None"
+        
+        -- If max size is notably bigger than min size (by >5%), something is currently scaled up (equipped)
+        if maxArea > (minArea * 1.05) then
+            for _, data in ipairs(items) do
+                if data.area >= (maxArea * 0.95) then
+                    activeIndex = data.index
+                    break
+                end
+            end
+        end
+        
+        -- Success match, exit immediately
+        if activeIndex == targetStr then
+            return true 
+        end
+        
+        -- Not equipped or nothing is equipped, so tap the key to toggle it
+        tapKey(vKey)
+        wait(0.3) -- Wait for the UI to animate and the tool to draw
+    end
+    return false
+end
+
+function getTargetPos(target)
+    if not target then return nil end
+    local char = target.Character
+    if not char then return nil end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    return root and root.Position
+end
+
+-- Dynamic Targeting Alternative Scanner to chain arrests within given bounds on foot
+function getNearbyAlternativeTarget(currentPos, maxRadius, ignoreTarget)
+    maxRadius = maxRadius or 120
+    if not currentPos then return nil end
+    local targetablePlayers = {}
+    local now = tonumber(tick()) or 0
+    
+    local localName = tostring(player.Name)
+    local localTeamName = ""
+    pcall(function()
+        if player.Team then
+            localTeamName = tostring(player.Team.Name)
+        end
+    end)
+
+    local activePlayerSpeedH = tonumber(S.playerSpeedHorizontal) or 110
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if ignoreTarget and p == ignoreTarget then continue end
+        
+        local targetable = true
+        
+        if S.blacklistedPlayers[p.Name] and now < S.blacklistedPlayers[p.Name] then
+            targetable = false
+        end
+
+        pcall(function()
+            if p.Team and tostring(p.Team.Name) == localTeamName then
+                targetable = false
+            end
+            if p:GetAttribute("HasEscaped") ~= true then
+                targetable = false
+            end
+        end)
+
+        if p.Name ~= localName and targetable and p.Character then
+            local root = p.Character:FindFirstChild("HumanoidRootPart")
+            if root and root.Position then
+                local targetY = tonumber(root.Position.Y) or 0
+                local isUnderground = targetY < 13
+
+                if not isUnderground then
+                    local dx = root.Position.X - currentPos.X
+                    local dy = root.Position.Y - currentPos.Y
+                    local dz = root.Position.Z - currentPos.Z
+                    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                    -- Filter by passed range boundary
+                    if dist <= maxRadius then
+                        -- Fetch target velocity to compare with player on-foot flight limits
+                        local speed = 0
+                        local vel = root.AssemblyLinearVelocity or root.Velocity
+                        if vel then
+                            speed = math.sqrt(vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z)
+                        end
+                        
+                        -- Target speed limit constraint
+                        if speed < activePlayerSpeedH then
+                            local rawName = p.Name or ""
+                            local rawDisplay = p.DisplayName or ""
+                            
+                            local lowerName = string.lower(rawName)
+                            local lowerDisplay = string.lower(rawDisplay)
+                            
+                            local pBounty = tonumber(S.scrapedBounties[lowerName]) or tonumber(S.scrapedBounties[lowerDisplay]) or 0
+                            
+                            table.insert(targetablePlayers, {
+                                player = p,
+                                dist = dist,
+                                bounty = pBounty
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if #targetablePlayers > 0 then
+        if S.prioritizeBounty then
+            table.sort(targetablePlayers, function(a, b)
+                if a.bounty ~= b.bounty then
+                    return a.bounty > b.bounty
+                end
+                return a.dist < b.dist
+            end)
+        else
+            table.sort(targetablePlayers, function(a, b)
+                return a.dist < b.dist
+            end)
+        end
+        return targetablePlayers[1].player
+    end
+
+    return nil
+end
+
+-- String parser to translate game timers (e.g. "0:45", "15S", "10") to seconds
+function parseCooldownSeconds(text)
+    text = tostring(text):upper()
+    -- Pattern A: "MM:SS" (e.g., "1:15" or "0:45")
+    local min, sec = text:match("(%d+):(%d+)")
+    if min and sec then
+        return (tonumber(min) * 60) + tonumber(sec)
+    end
+    -- Pattern B: Raw numeric countdowns (e.g. "45S" or "10 SECONDS")
+    local digits = text:match("(%d+)")
+    if digits then
+        return tonumber(digits)
+    end
+    return 0
+end
+
+-- Safely acquires the interaction prompt value from PlayerGui
+function getActionText()
+    local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if not playerGui then return nil end
+    
+    local circleAction1 = playerGui:FindFirstChild("CircleAction")
+    local circleAction2 = circleAction1 and circleAction1:FindFirstChild("CircleAction")
+    local helpObj = circleAction2 and circleAction2:FindFirstChild("Help")
+    
+    if helpObj then
+        local success, text = pcall(function()
+            return helpObj.Text
+        end)
+        if success and text then
+            return text:match("^%s*(.-)%s*$") -- Clean leading/trailing spaces
+        end
+    end
+    return nil
+end
+
+-- Defensively structured to prevent nil indexing if vehicles delete or stream out mid-execution
+function scanForCar()
+    local pname = player.Name
+    local vehiclesFolder = Workspace:FindFirstChild("Vehicles")
+    if not vehiclesFolder then return nil end
+    
+    for _, v in ipairs(vehiclesFolder:GetChildren()) do
+        if v:FindFirstChild("_VehicleState_" .. pname) then 
+            return v 
+        end
+        
+        local seat = v:FindFirstChild("Seat")
+        if seat then
+            local playerNameVal = seat:FindFirstChild("PlayerName")
+            if playerNameVal and playerNameVal.Value == pname then 
+                return v 
+            end
+        end
+    end
+    return nil
+end
+
+function getCarCached()
+    local now = tonumber(tick()) or 0
+    local searchTime = tonumber(S.nextCarSearch) or 0
+    
+    -- Bypass caching cooldowns if we are currently searching for our car to enter
+    if S.isReturningToCar then
+        local car = scanForCar()
+        if car then
+            S.cachedCar = car
+            S.cachedRoot = car.PrimaryPart or car:FindFirstChild("Collision") or car:FindFirstChild("Body") or car:FindFirstChildWhichIsA("BasePart")
+        else
+            S.cachedCar = nil
+            S.cachedRoot = nil
+        end
+        return S.cachedCar, S.cachedRoot
+    end
+    
+    -- Standard caching logic during normal flight
+    if not S.cachedCar or now >= searchTime then
+        local car = scanForCar()
+        if car then
+            S.cachedCar = car
+            S.cachedRoot = car.PrimaryPart or car:FindFirstChild("Collision") or car:FindFirstChild("Body") or car:FindFirstChildWhichIsA("BasePart")
+            S.nextCarSearch = now + 2.0
+        else
+            S.cachedCar = nil
+            S.cachedRoot = nil
+            S.nextCarSearch = now + 0.3
+        end
+    end
+    return S.cachedCar, S.cachedRoot
+end
+
+function getNearestPlayer(currentPos)
+    local targetablePlayers = {}
+    local now = tonumber(tick()) or 0
+    
+    local localName = tostring(player.Name)
+    local localTeamName = ""
+    pcall(function()
+        if player.Team then
+            localTeamName = tostring(player.Team.Name)
+        end
+    end)
+
+    local activeInCarMax = tonumber(S.inCarMaxRange) or 3500
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        local targetable = true
+        
+        -- Filter out blacklisted players
+        if S.blacklistedPlayers[p.Name] and now < S.blacklistedPlayers[p.Name] then
+            targetable = false
+        end
+
+        pcall(function()
+            -- Ignore teammates
+            if p.Team and tostring(p.Team.Name) == localTeamName then
+                targetable = false
+            end
+            -- Attribute Check: Only targets players whose HasEscaped is true
+            if p:GetAttribute("HasEscaped") ~= true then
+                targetable = false
+            end
+            
+            -- Dynamic Speed Limit Safety Filter (Prevents selecting targets that exceed active limits)
+            if S.filterBySpeed and targetable and p.Character then
+                local root = p.Character:FindFirstChild("HumanoidRootPart") or p.Character.PrimaryPart
+                local vel = root and (root.AssemblyLinearVelocity or root.Velocity)
+                if vel then
+                    local speed = math.sqrt(vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z)
+                    local maxSpeed = tonumber(S.maxTargetSpeedStuds) or 80
+                    if speed > maxSpeed then
+                        targetable = false
+                    end
+                end
+            end
+        end)
+
+        if p.Name ~= localName and targetable and p.Character then
+            local root = p.Character:FindFirstChild("HumanoidRootPart")
+            if root and root.Position and currentPos then
+                -- Filter out players in sewers/underground (typically Y < 13 studs)
+                local targetY = tonumber(root.Position.Y) or 0
+                local isUnderground = targetY < 13
+
+                if not isUnderground then
+                    -- Native 3D algebraic geometry distance
+                    local dx = root.Position.X - currentPos.X
+                    local dy = root.Position.Y - currentPos.Y
+                    local dz = root.Position.Z - currentPos.Z
+                    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                    -- Pre-filter by pursuit limit range
+                    if dist <= activeInCarMax then
+                        -- Safe Double Lowercase mapping (Username and DisplayName) to prevent Matcha nil lower-indexing crashes
+                        local rawName = p.Name or ""
+                        local rawDisplay = p.DisplayName or ""
+                        
+                        local lowerName = string.lower(rawName)
+                        local lowerDisplay = string.lower(rawDisplay)
+                        
+                        local pBounty = tonumber(S.scrapedBounties[lowerName]) or tonumber(S.scrapedBounties[lowerDisplay]) or 0
+                        
+                        table.insert(targetablePlayers, {
+                            player = p,
+                            dist = dist,
+                            bounty = pBounty
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    -- Return targeted choices based on sorting configurations
+    if #targetablePlayers > 0 then
+        if S.prioritizeBounty then
+            table.sort(targetablePlayers, function(a, b)
+                if a.bounty ~= b.bounty then
+                    return a.bounty > b.bounty -- Highest bounty takes global priority
+                end
+                return a.dist < b.dist -- Fall back to proximity on tied bounty values
+            end)
+            local selected = targetablePlayers[1]
+            print(string.format("[CarFly Debug] Target selected by BOUNTY: %s (Bounty: $%d, Dist: %d studs)", selected.player.Name, selected.bounty, math.floor(selected.dist)))
+            return selected.player
+        else
+            table.sort(targetablePlayers, function(a, b)
+                return a.dist < b.dist -- Standard proximity priority
+            end)
+            local selected = targetablePlayers[1]
+            print(string.format("[CarFly Debug] Target selected by DISTANCE: %s (Bounty: $%d, Dist: %d studs)", selected.player.Name, selected.bounty, math.floor(selected.dist)))
+            return selected.player
+        end
+    end
+
+    return nil
+end
+
+function getClosestCamaro(currentPos)
+    local vehiclesFolder = Workspace:FindFirstChild("Vehicles")
+    if not vehiclesFolder then return nil, 999999999 end
+
+    local nearest = nil
+    local minDist = 999999999
+    local now = tonumber(tick()) or 0
+
+    local function checkVehicle(v)
+        -- Ignore vehicles flagged as glitched/unenterable
+        if S.blacklistedVehicles[v] and now < S.blacklistedVehicles[v] then
+            return
+        end
+
+        local root = v.PrimaryPart or v:FindFirstChild("Collision") or v:FindFirstChild("Body") or v:FindFirstChildWhichIsA("BasePart")
+        if root and root.Position then
+            -- Native algebraic distance
+            local dx = root.Position.X - currentPos.X
+            local dy = root.Position.Y - currentPos.Y
+            local dz = root.Position.Z - currentPos.Z
+            local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            if dist < minDist then
+                minDist = dist
+                nearest = v
+            end
+        end
+    end
+
+    -- Path A: Camaro Folder inside Vehicles
+    local camaroFolder = vehiclesFolder:FindFirstChild("Camaro")
+    if camaroFolder then
+        for _, v in ipairs(camaroFolder:GetChildren()) do
+            checkVehicle(v)
+        end
+    end
+
+    -- Path B: Individual Camaros directly inside Vehicles folder
+    for _, v in ipairs(vehiclesFolder:GetChildren()) do
+        if v.Name == "Camaro" then
+            checkVehicle(v)
+        end
+    end
+
+    return nearest, minDist
+end
+
+-- Click UI Object safely using Matcha viewport coordinates + micro-movement offset
+function clickGui(gui)
+    if gui and gui:IsA("GuiObject") then
+        local pos = gui.AbsolutePosition
+        local size = gui.AbsoluteSize
+        if pos and size then
+            local cx = math.floor(pos.X + (size.X / 2))
+            local cy = math.floor(pos.Y + (size.Y / 2))
+            
+            -- Warp to element center
+            mousemoveabs(cx, cy)
+            wait(0.05)
+            
+            -- Shift cursor by 3px horizontally/vertically to force VM mouseover replication
+            mousemoveabs(cx + 3, cy + 3)
+            wait(0.05)
+            
+            -- Click element
+            clickMouse()
+        end
+    end
+end
+
+-- Execute Camaro Spawning Sequence with dynamic polling and human-like hover delays
+function attemptGarageSpawn()
+    local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if not playerGui then 
+        print("[CarFly Debug] Error: PlayerGui folder could not be located under LocalPlayer!")
+        return 
+    end
+
+    local garageBtn = getPath(playerGui, "AppUI", "Buttons", "Sidebar", "Garage", "Garage")
+    if not garageBtn then
+        print("[CarFly Debug] Error: Sidebar Garage button path is missing from AppUI!")
+        return
+    end
+
+    S.isCheckingGarage = true
+    if S.statusLabel then
+        S.statusLabel:SetText("Status: Opening Garage Panel...")
+    end
+    clickGui(garageBtn) -- Open Garage
+
+    -- Poll until we read an active status (up to 2.0 seconds timeout)
+    local checkStart = tonumber(tick()) or 0
+    local textVal = ""
+
+    while (tonumber(tick()) or 0) - checkStart < 2.0 do
+        local cooldownTitle = getPath(playerGui, "AppUI", "Garage", "Left", "Categories", "Cooldown", "Title")
+        local rawText = cooldownTitle and cooldownTitle.Text and tostring(cooldownTitle.Text) or ""
+        
+        -- Safe string trimming
+        rawText = rawText:match("^%s*(.-)%s*$") or ""
+        
+        if rawText ~= "" then
+            textVal = rawText:upper()
+            break
+        end
+        wait(0.05) -- Brief delay between checks to prevent lag
+    end
+
+    print("[CarFly Debug] Cooldown text value validated: '" .. textVal .. "'")
+
+    if textVal == "READY" then
+        local spawnBtn = getPath(playerGui, "AppUI", "Garage", "Center", "Portal", "Body", "ScrollingGrid", "Camaro")
+        if spawnBtn then
+            if S.statusLabel then
+                S.statusLabel:SetText("Status: Spawning Camaro...")
+            end
+            
+            -- Micro-Movement Hover Sequence: Warp center -> slide offset -> wait 0.5s -> click
+            local pos = spawnBtn.AbsolutePosition
+            local size = spawnBtn.AbsoluteSize
+            if pos and size then
+                local cx = math.floor(pos.X + (size.X / 2))
+                local cy = math.floor(pos.Y + (size.Y / 2))
+                
+                mousemoveabs(cx, cy) -- Warp to Camaro center
+                wait(0.1)
+                
+                mousemoveabs(cx + 3, cy + 3) -- Micro-slide to force hover register
+                wait(0.4) -- Complete remaining 0.5s pause
+                
+                clickMouse() -- Click spawned grid item
+            end
+            wait(0.2)
+            
+            -- Reset memory lockout since spawn was successful
+            S.garageCooldownExpiry = 0
+            
+            -- Seating E-press (Explicit thread closures required by Matcha)
+            task.spawn(function()
+                tapKey(0x45)
+            end)
+        end
+    else
+        -- Not READY: Close menu & Parse how long is left to store standard lockout timestamp
+        local parsedSeconds = parseCooldownSeconds(textVal)
+        local currentTime = tonumber(tick()) or 0
+        if parsedSeconds and parsedSeconds > 0 then
+            S.garageCooldownExpiry = currentTime + parsedSeconds
+            print(string.format("[CarFly Debug] Storing Garage lock for %s seconds.", tostring(parsedSeconds)))
+        else
+            -- Backup short Lockout block
+            S.garageCooldownExpiry = currentTime + 10
+        end
+
+        if S.statusLabel then
+            S.statusLabel:SetText("Status: Spawner locked. Closing...")
+        end
+        clickGui(garageBtn)
+        wait(0.15)
+    end
+
+    S.isCheckingGarage = false
+end
+
+function forceReleaseE()
+    if S.holdingE then
+        pcall(function()
+            keyrelease(0x45) -- Release E key (Virtual Code 0x45)
+            keyrelease(0x32) -- Force release '2' key (Virtual Code 0x32) just in case
+        end)
+        S.holdingE = false
+    end
+end
+
+-- Create Window and UI Elements
+local win = Lib:CreateWindow({
+    title = "Vehicle Utility",
+    size = Vector2.new(550, 440),
+    menuKey = "p"
+})
+
+local tab = win:Tab("Movement", "rocket")
+local leftSec = tab:Section("Auto-Arrest Controls", "Left")
+local rightSec = tab:Section("Flight Settings", "Right")
+
+-- Labels to show current tracking state (Stored in persistent state to prevent VM sweeps)
+S.statusLabel = leftSec:Label("Status: Idle")
+S.targetLabel = leftSec:Label("Target: None")
+
+-- UI Widgets configuration
+S.flyToggle = leftSec:Toggle("Enable Auto-Fly", false, function(on)
+    S.enabled = on
+    if on then
+        S.ascended = false
+        S.aligned = false
+        S.isArresting = false
+        S.isReturningToCar = false
+        S.returnAscended = false
+        S.returnAligned = false
+        S.isCheckingGarage = false
+        S.diedRespawnedWalk = false
+        S.respawnRoutingActive = false
+        S.isWaitingAtWaypoint = false
+        S.waypointReachedTime = 0
+        S.seatEntryStart = 0
+        S.sittingTargetVehicle = nil
+        S.isAimingTaser = false
+        
+        -- Immediate car-check when turned on (including active seat check)
+        local car, carPart = getCarCached()
+        if not car or not carPart then
+            S.isReturningToCar = true
+            if S.statusLabel then
+                S.statusLabel:SetText("Status: Initializing (Finding Car)...")
+            end
+        end
+    else
+        S.ascended = false
+        S.aligned = false
+        S.isArresting = false
+        S.isReturningToCar = false
+        S.returnAscended = false
+        S.returnAligned = false
+        S.isCheckingGarage = false
+        S.diedRespawnedWalk = false
+        S.respawnRoutingActive = false
+        S.isWaitingAtWaypoint = false
+        S.waypointReachedTime = 0
+        S.seatEntryStart = 0
+        S.sittingTargetVehicle = nil
+        S.isAimingTaser = false
+        forceReleaseE()
+        S.targetPlayer = nil
+        S.lastCheckedPos = nil
+        if S.statusLabel then S.statusLabel:SetText("Status: Idle") end
+        if S.targetLabel then S.targetLabel:SetText("Target: None") end
+        
+        -- Instantly zero out velocity on turn-off so physics returns to normal
+        local car, carPart = getCarCached()
+        if carPart then
+            pcall(function()
+                carPart.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
+                carPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+            end)
+        end
+    end
+end)
+
+S.flyToggle:AddKeybind("g", "Toggle")
+
+leftSec:Toggle("Use Taser", false, function(on)
+    S.useTaser = on
+end)
+
+leftSec:Toggle("Prioritize Highest Bounty", false, function(on)
+    S.prioritizeBounty = on
+end)
+
+leftSec:Toggle("Filter High Speed", false, function(on)
+    S.filterBySpeed = on
+end)
+
+leftSec:Slider("Max Target Speed", 80, 10, 10, 500, " studs/s", function(v)
+    S.maxTargetSpeedStuds = tonumber(v) or 80
+end)
+
+leftSec:RangeSlider("Pursuit Limit (Foot/Car)", 50, 3500, 25, 50, 4000, " studs", function(lo, hi)
+    S.onFootMaxRange = tonumber(lo) or 50
+    S.inCarMaxRange = tonumber(hi) or 3500
+end)
+
+-- Right Section Columns: Speeds, Heights and Actions
+rightSec:Button("Retarget Nearest", function()
+    if not S.enabled then return end
+    forceReleaseE()
+    S.targetPlayer = nil
+    S.aligned = false
+    S.isArresting = false
+    S.isReturningToCar = false
+    S.isCheckingGarage = false
+    S.diedRespawnedWalk = false
+    S.respawnRoutingActive = false
+    S.isWaitingAtWaypoint = false
+    S.waypointReachedTime = 0
+    S.lastCheckedPos = nil
+    if S.statusLabel then
+        S.statusLabel:SetText("Status: Searching for new target...")
+    end
+end)
+
+rightSec:Slider("Car Speed", 410, 10, 50, 450, " studs/s", function(v)
+    S.carSpeed = tonumber(v) or 410
+end)
+
+rightSec:Slider("Player Horiz Speed", 110, 10, 10, 150, " studs/s", function(v)
+    S.playerSpeedHorizontal = tonumber(v) or 110
+end)
+
+rightSec:Slider("Player Vert Speed", 100, 10, 10, 110, " studs/s", function(v)
+    S.playerSpeedVertical = tonumber(v) or 100
+end)
+
+rightSec:Slider("Flight Height", 250, 10, 50, 1000, " studs", function(v)
+    S.flyHeight = tonumber(v) or 250
+end)
+
+win:AddSettingsTab("cog")
+
+-- Background Thread: Scrapes physical Workspace Bounty Board model every 5.0 seconds
+task.spawn(function()
+    while true do
+        wait(5.0)
+        table.clear(S.scrapedBounties)
+        
+        pcall(function()
+            local bBoard = nil
+            for _, v in ipairs(Workspace:GetChildren()) do
+                if v.Name == "BountyBoard" or string.find(v.Name, "BountyBoard") then
+                    bBoard = v
+                    break
+                end
+            end
+            
+            if bBoard then
+                local boardContainer = getPath(bBoard, "Board", "MostWanted", "Board")
+                if boardContainer then
+                    for _, child in ipairs(boardContainer:GetChildren()) do
+                        if string.find(child.Name, "PlayerFrame") then
+                            local nameTextObj = child:FindFirstChild("NameText")
+                            local bountyTextObj = child:FindFirstChild("BountyText")
+                            
+                            local pName = nameTextObj and nameTextObj.Text and tostring(nameTextObj.Text) or ""
+                            local bText = bountyTextObj and bountyTextObj.Text and tostring(bountyTextObj.Text) or ""
+                            
+                            -- Strip spacing
+                            pName = pName:match("^%s*(.-)%s*$") or ""
+                            
+                            if pName ~= "" and bText ~= "" then
+                                -- Parse number cleanly by stripping non-digit symbols like '$' and ','
+                                local cleanBounty = bText:gsub("[^%d]", "") or "0"
+                                local bVal = tonumber(cleanBounty) or 0
+                                
+                                -- Save all matching parameters in standardized lowercase to ensure reliable lookups
+                                S.scrapedBounties[string.lower(pName)] = bVal
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+
+        -- Print active scraped database to console for clean F9 debugging
+        local logOutput = "[Bounty Board Scraper Log] "
+        local count = 0
+        for username, amount in pairs(S.scrapedBounties) do
+            logOutput = logOutput .. string.format("%s: $%d | ", username, amount)
+            count = count + 1
+        end
+        if count > 0 then
+            print(logOutput)
+        else
+            print("[Bounty Board Scraper Log] No active bounties found on board.")
+        end
+    end
+end)
+
+-- Main Physics Loop
+task.spawn(function()
+    while true do
+        wait(0.016)
+        if not S.enabled then continue end
+        local currentTick = tonumber(tick()) or 0
+
+        -- Fetch Character Root
+        local myChar = player.Character
+        local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar.PrimaryPart)
+        
+        -- Continuous Death & Respawn transition checker (Dynamic Post-Death Route Multi-Selector)
+        local humanoid = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            if humanoid.Health == 0 then
+                if not S.isDeadState then
+                    S.isDeadState = true
+                    S.needsRespawnSequence = true
+                    S.respawnTime = 0 -- Reset respawn timestamp
+                end
+            else
+                if S.isDeadState then
+                    -- Transition Event: Character went from 0 health to alive (loaded back in)
+                    S.isDeadState = false
+                    S.respawnTime = tonumber(tick()) or 0 -- Lock actual spawn loading moment
+                end
+                
+                if S.needsRespawnSequence then
+                    local spawnTime = tonumber(S.respawnTime) or 0
+                    
+                    -- Dynamic Settle Delay: Wait exactly 0.5 seconds for game server coordinates to teleport you and settle
+                    if spawnTime > 0 and (currentTick - spawnTime > 0.5) then
+                        if myRoot and myRoot.Position then
+                            S.needsRespawnSequence = false -- Consume flag
+                            
+                            local myPos = myRoot.Position
+                            
+                            -- Setup target start points of your 5 recovery exits
+                            local r1Start = Vector3.new(1750.4, 24.83, -4008.74)
+                            local r2Start = Vector3.new(-1131.70, 18.85, -1587.14)
+                            local r3Start = Vector3.new(725.65, 44.95, 1084.91)
+                            local r4Start = Vector3.new(1826.70, 25.54, -871.26)
+                            local r5Start = Vector3.new(-1145.17, 39.19, -1566.10)
+                            
+                            -- Determine distances to choose the closest police spawn point automatically (Y-axis hardened)
+                            local routes = {
+                                { start = r1Start, action = "spawn", skipGarage = false, waypoints = { r1Start, Vector3.new(1727.23, 23.50, -4009.02), Vector3.new(1750.4, 24.83, -3960.0) }, name = "Route 1" },
+                                { start = r2Start, action = "spawn", skipGarage = false, waypoints = { r2Start, Vector3.new(-1105.05, 18.40, -1513.06) }, name = "Route 2" },
+                                { start = r3Start, action = "find", skipGarage = true, waypoints = { r3Start }, name = "Route 3" },
+                                { start = r4Start, action = "spawn", skipGarage = false, waypoints = { r4Start }, name = "Route 4" },
+                                { start = r5Start, action = "spawn", skipGarage = false, waypoints = { r5Start, Vector3.new(-1112.57, 38.25, -1562.00) }, name = "Route 5" }
+                            }
+                            
+                            local validRoutes = {}
+                            for _, r in ipairs(routes) do
+                                -- Discard vertically separated spawns (Y difference > 8 studs) to prevent downstairs/upstairs mismatches
+                                local yDiff = math.abs(myPos.Y - r.start.Y)
+                                if yDiff <= 8 then
+                                    local dist = (myPos - r.start).Magnitude
+                                    table.insert(validRoutes, { route = r, dist = dist })
+                                end
+                            end
+                            
+                            -- Proximity fallback
+                            if #validRoutes == 0 then
+                                for _, r in ipairs(routes) do
+                                    local dist = (myPos - r.start).Magnitude
+                                    table.insert(validRoutes, { route = r, dist = dist })
+                                end
+                            end
+                            
+                            table.sort(validRoutes, function(a, b)
+                                return a.dist < b.dist
+                            end)
+                            
+                            local chosen = validRoutes[1].route
+                            S.deathRouteWaypoints = chosen.waypoints
+                            S.deathRouteIndex = 1
+                            S.deathRouteAction = chosen.action
+                            S.skipGarageCheck = chosen.skipGarage
+                            S.garageCooldownExpiry = 0 -- Unlock spawner
+                            S.isWaitingAtWaypoint = false
+                            S.waypointReachedTime = 0
+                            
+                            print(string.format("[CarFly Recovery] Respawn detected near %s. Initializing route...", chosen.name))
+                            
+                            S.respawnRoutingActive = true
+                            S.isReturningToCar = false -- Suspend standard returns until waypoint flight is cleared
+                        end
+                    end
+                end
+            end
+        end
+        
+        local car, carPart = getCarCached()
+        local currentPos = nil
+
+        -- Determine positioning anchor dynamically (Fall back to on-foot if not seated/found)
+        if S.isArresting or S.isReturningToCar or S.respawnRoutingActive or not car then
+            currentPos = myRoot and myRoot.Position
+        else
+            currentPos = carPart and carPart.Position
+        end
+
+        if not currentPos then 
+            if S.statusLabel then
+                S.statusLabel:SetText("Status: Waiting for vehicle or character...")
+            end
+            continue 
+        end
+
+        -- [NEW] Proximity Check (120 studs) exclusively for when we are returning to the car
+        if S.isReturningToCar and not S.isCheckingGarage then
+            local alt = getNearbyAlternativeTarget(currentPos, 120, S.targetPlayer)
+            if alt then
+                S.isReturningToCar = false
+                S.targetPlayer = alt
+                S.isArresting = true
+                S.aligned = false
+                S.lastDistanceToTarget = 999999999
+                S.lastDistanceCheckTime = currentTick
+                notify("Target found nearby! Hijacking chase: " .. alt.Name, "CarFly", 3)
+                if S.targetLabel then
+                    S.targetLabel:SetText("Target: " .. alt.Name)
+                end
+                continue
+            end
+        end
+
+        local vx, vy, vz = 0, 0, 0
+
+        -- Isolating variables defensively
+        local activeHeight = tonumber(S.flyHeight) or 250
+        local activeCarSpeed = tonumber(S.carSpeed) or 410
+        local activePlayerSpeedH = tonumber(S.playerSpeedHorizontal) or 110
+        local activePlayerSpeedV = tonumber(S.playerSpeedVertical) or 100
+        local currentY = currentPos and tonumber(currentPos.Y) or 0
+
+        -- Camera Lock Aimbot Loop (Fires continuously when S.isAimingTaser is active)
+        if S.isAimingTaser and S.targetPlayer then
+            local targetChar = S.targetPlayer.Character
+            local targetRoot = targetChar and (targetChar:FindFirstChild("HumanoidRootPart") or targetChar.PrimaryPart)
+            if targetRoot then
+                local screenPos, onScreen = WorldToScreen(targetRoot.Position)
+                if onScreen then
+                    local mouseObj = player:GetMouse()
+                    local mX = mouseObj.X
+                    local mY = mouseObj.Y
+                    -- Smooth project camera translation directly to target screen pixel position (Responsiveness factor: 3)
+                    local diffX = (screenPos.X - mX) / 3
+                    local diffY = (screenPos.Y - mY) / 3
+                    pcall(mousemoverel, diffX, diffY)
+                end
+            end
+        end
+
+        -- Post-Death Waypoint Glide Controller with 0.5s Settle Waiting Block
+        if S.respawnRoutingActive then
+            local waypoints = S.deathRouteWaypoints or {}
+            local index = S.deathRouteIndex or 1
+            local targetWaypoint = waypoints[index]
+            
+            if not targetWaypoint then
+                -- All recovery waypoints successfully cleared. Transition to spawner or closest-car intercept
+                S.respawnRoutingActive = false
+                S.isReturningToCar = true
+                S.returnAscended = false
+                S.returnAligned = false
+                S.isWaitingAtWaypoint = false
+                S.waypointReachedTime = 0
+                continue
+            end
+
+            -- Dynamic Height Check: Ignore and skip ONLY this specific waypoint node if its Y coordinates exceed player Y by more than +5.0 studs
+            if currentPos then
+                local yDiff = targetWaypoint.Y - currentPos.Y
+                if yDiff > 5 then
+                    print(string.format("[CarFly Recovery] Dynamic Height bypass: Skipping Waypoint %d (Height delta of +%.2f exceeds limit of 5.0 studs)", index, yDiff))
+                    S.deathRouteIndex = index + 1
+                    S.isWaitingAtWaypoint = false
+                    S.waypointReachedTime = 0
+                    continue
+                end
+            end
+            
+            if S.isWaitingAtWaypoint then
+                if S.statusLabel then
+                    S.statusLabel:SetText(string.format("Status: Settle Pause at Waypoint %d/%d...", index, #waypoints))
+                end
+                
+                -- Completely zero out velocity to stand still during the 0.5s settle delay
+                if myRoot then
+                    pcall(function()
+                        myRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        myRoot.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                    end)
+                end
+                
+                local reachedTime = tonumber(S.waypointReachedTime) or 0
+                if currentTick - reachedTime >= 0.5 then
+                    -- 0.5 seconds elapsed! Progress to next waypoint
+                    S.isWaitingAtWaypoint = false
+                    S.waypointReachedTime = 0
+                    S.deathRouteIndex = index + 1
+                end
+                continue
+            end
+            
+            local dx = targetWaypoint.X - currentPos.X
+            local dy = targetWaypoint.Y - currentPos.Y
+            local dz = targetWaypoint.Z - currentPos.Z
+            local distanceToWaypoint = math.sqrt(dx * dx + dy * dy + dz * dz)
+            
+            if distanceToWaypoint > 6 then
+                if S.statusLabel then
+                    S.statusLabel:SetText(string.format("Status: Respawning Flight Waypoint %d/%d...", index, #waypoints))
+                end
+                
+                -- Move smoothly toward waypoint in 3D using velocity controls with deceleration clamping
+                local direction = targetWaypoint - currentPos
+                local flatDir = Vector3.new(direction.X, 0, direction.Z)
+                local flatDist = flatDir.Magnitude
+                
+                local vxCent, vyCent, vzCent = 0, 0, 0
+                if flatDist > 2 then
+                    local walkDirection = flatDir.Unit * activePlayerSpeedH
+                    vxCent = walkDirection.X
+                    vzCent = walkDirection.Z
+                end
+                
+                if math.abs(direction.Y) > 3 then
+                    vyCent = (direction.Y > 0 and 1 or -1) * activePlayerSpeedV
+                end
+                
+                if myRoot then
+                    pcall(function()
+                        myRoot.AssemblyLinearVelocity = Vector3.new(vxCent, vyCent, vzCent)
+                        myRoot.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                    end)
+                end
+            else
+                -- Touched targeted coordinate! Flag wait state to pause horizontal drift
+                S.isWaitingAtWaypoint = true
+                S.waypointReachedTime = currentTick
+            end
+            continue
+        end
+
+        -- Return-to-Car Handler
+        if S.isReturningToCar then
+            if S.statusLabel then
+                S.statusLabel:SetText("Status: Returning to Car...")
+            end
+            
+            -- Detect if we have successfully sat inside the vehicle (checked 60 times/sec)
+            if car then
+                S.isReturningToCar = false
+                S.forceSpawnNext = false 
+                S.skipGarageCheck = false -- Reset spawner bypass flag
+                S.seatEntryStart = 0
+                S.sittingTargetVehicle = nil
+                S.ascended = false
+                S.aligned = false
+                S.targetPlayer = nil
+                if S.statusLabel then
+                    S.statusLabel:SetText("Status: Flying...")
+                end
+                
+                -- Force immediate vehicle cache reset to acquire your vehicle coordinates instantly
+                S.cachedCar = nil
+                S.nextCarSearch = 0
+                getCarCached()
+                continue
+            end
+
+            -- Priority A: Check if spawner is ready and trigger dynamic spawn immediately (Bypassed if skipGarageCheck is active)
+            local cooldownExpiry = tonumber(S.garageCooldownExpiry) or 0
+
+            if not S.skipGarageCheck and not S.isCheckingGarage and currentTick >= cooldownExpiry then
+                task.spawn(function()
+                    attemptGarageSpawn()
+                end)
+                continue -- Temporarily suspend on-foot tracking while spawn menu sequence executes
+            end
+
+            -- Priority B: Gliding logic
+            if not S.isCheckingGarage then
+                local closestCamaro, camaroDist = getClosestCamaro(currentPos)
+                if not closestCamaro then
+                    if S.statusLabel then
+                        S.statusLabel:SetText("Status: Waiting for Camaro (Cooldown)...")
+                    end
+                    continue
+                end
+
+                -- Safe Return-to-Car via 3-Phase Overhead Flight path
+                if closestCamaro and myRoot then
+                    local seat = closestCamaro:FindFirstChild("Seat") or closestCamaro:FindFirstChildWhichIsA("VehicleSeat")
+                    local targetSeatPos = nil
+                    if seat then
+                        targetSeatPos = seat.Position
+                    else
+                        local primary = closestCamaro.PrimaryPart or closestCamaro:FindFirstChildWhichIsA("BasePart")
+                        targetSeatPos = primary and primary.Position
+                    end
+
+                    if targetSeatPos then
+                        -- Check XZ horizontal distance using native flat geometry
+                        local flatDx = targetSeatPos.X - currentPos.X
+                        local flatDz = targetSeatPos.Z - currentPos.Z
+                        local horizontalDistance = math.sqrt(flatDx * flatDx + flatDz * flatDz)
+
+                        if not S.returnAscended then
+                            -- Phase A: Go straight up to activeHeight
+                            if S.statusLabel then
+                                S.statusLabel:SetText("Status: Return (Ascending)...")
+                            end
+                            if currentY < activeHeight then
+                                vy = activePlayerSpeedV
+                                
+                                -- Skydiving/Fall Detection double space click (ONLY on Player Ascension phase)
+                                local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+                                local fallingGui = playerGui and playerGui:FindFirstChild("FallingGui")
+                                local buttonObj = fallingGui and fallingGui:FindFirstChild("Button")
+                                if buttonObj then
+                                    local nowTick = tonumber(tick()) or 0
+                                    local lastSpace = tonumber(S.lastSpaceDoubleTap) or 0
+                                    if nowTick - lastSpace > 0.5 then
+                                        S.lastSpaceDoubleTap = nowTick
+                                        task.spawn(function()
+                                            tapKey(0x20) -- Press Space
+                                            wait(0.05)   -- Lowered internal delay to 0.05s
+                                            tapKey(0x20) -- Press Space
+                                        end)
+                                    end
+                                end
+                            else
+                                S.returnAscended = true
+                            end
+                        elseif not S.returnAligned then
+                            -- Phase B: Glide horizontally keeping height locked to activeHeight
+                            if S.statusLabel then
+                                S.statusLabel:SetText("Status: Return (Aligning over car)...")
+                            end
+                            local flatDirection = Vector3.new(targetSeatPos.X - currentPos.X, 0, targetSeatPos.Z - currentPos.Z)
+                            local flatDistance = flatDirection.Magnitude
+
+                            -- Tolerant 2D flat XZ alignment radius (8 studs) to prevent stalling
+                            if flatDistance > 8 then
+                                local velocity = flatDirection.Unit * activePlayerSpeedH
+                                vx = velocity.X
+                                vy = 0
+                                
+                                -- Minor vertical correction in alignment to counteract gravity drift
+                                local heightDiff = activeHeight - currentY
+                                if math.abs(heightDiff) > 5 then
+                                    vy = (heightDiff > 0 and 1 or -1) * 35
+                                end
+                                vz = velocity.Z
+                            else
+                                S.returnAligned = true
+                            end
+                        else
+                            -- Phase C: Descend straight down onto seat
+                            if S.statusLabel then
+                                S.statusLabel:SetText("Status: Return (Descending onto car)...")
+                            end
+                            local direction = targetSeatPos - currentPos
+                            local distToSeat = math.sqrt(direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z)
+
+                            -- Generous 8-stud threshold to begin the interaction sequence
+                            if distToSeat > 8 then
+                                -- Proportional velocity calculations with horizontal/vertical split
+                                local velocity = direction * 15
+                                local hMag = math.sqrt(velocity.X * velocity.X + velocity.Z * velocity.Z)
+                                if hMag > activePlayerSpeedH then
+                                    local ratio = activePlayerSpeedH / hMag
+                                    velocity = Vector3.new(velocity.X * ratio, velocity.Y, velocity.Z * ratio)
+                                end
+                                if math.abs(velocity.Y) > activePlayerSpeedV then
+                                    velocity = Vector3.new(velocity.X, (velocity.Y > 0 and 1 or -1) * activePlayerSpeedV, velocity.Z)
+                                end
+                                vx = velocity.X
+                                vy = velocity.Y
+                                vz = velocity.Z
+                            else
+                                -- Sit coordinates lock (GENTLE physics float prevents sitting cancel glitches, no hard teleports!)
+                                local velocity = direction * 5
+                                vx = velocity.X
+                                vy = velocity.Y
+                                vz = velocity.Z
+
+                                -- Track entry duration on the targeted vehicle seat
+                                if S.sittingTargetVehicle ~= closestCamaro then
+                                    S.sittingTargetVehicle = closestCamaro
+                                    S.seatEntryStart = currentTick
+                                end
+
+                                -- If E clicking fails for more than 10.0 seconds, ignore this Camaro and find another
+                                local entryStart = tonumber(S.seatEntryStart) or 0
+                                if entryStart > 0 and (currentTick - entryStart > 10.0) then
+                                    S.blacklistedVehicles[closestCamaro] = currentTick + 45 -- Blacklist car for 45 seconds
+                                    notify("Seat Locked or Glitched! Routing to next Camaro...", "CarFly", 3)
+                                    
+                                    S.seatEntryStart = 0
+                                    S.sittingTargetVehicle = nil
+                                    S.returnAscended = false
+                                    S.returnAligned = false
+                                    continue
+                                end
+
+                                -- Cooldown E-Tap System: Only taps E once every 1.0 second on seat coordinates
+                                local lastETap = tonumber(S.lastETapTime) or 0
+                                if currentTick - lastETap > 1.0 then
+                                    S.lastETapTime = currentTick
+                                    task.spawn(function()
+                                        tapKey(0x45)
+                                    end)
+                                end
+                            end
+                        end
+
+                        -- Apply proportional velocity vector to player character
+                        if (vx ~= 0 or vy ~= 0 or vz ~= 0) then
+                            pcall(function()
+                                myRoot.AssemblyLinearVelocity = Vector3.new(vx, vy, vz)
+                                myRoot.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                            end)
+                        end
+                    end
+                end
+            end
+
+            -- Run Return-to-Car Position Stuck check
+            local lastPos = tonumber(S.lastPosCheck) or 0
+            if currentTick - lastPos > 4.0 then
+                S.lastPosCheck = currentTick
+                if S.lastCheckedPos then
+                    local moved = 999
+                    if S.lastCheckedPos and currentPos then
+                        pcall(function()
+                            local mX = currentPos.X - S.lastCheckedPos.X
+                            local mY = currentPos.Y - S.lastCheckedPos.Y
+                            local mZ = currentPos.Z - S.lastCheckedPos.Z
+                            moved = math.sqrt(mX * mX + mY * mY + mZ * mZ)
+                        end)
+                    end
+
+                    local applyingVelocity = (vx ~= 0 or vy ~= 0 or vz ~= 0)
+                    if applyingVelocity and moved < 5 then
+                        local closestCamaro = getClosestCamaro(currentPos)
+                        if closestCamaro then
+                            S.blacklistedVehicles[closestCamaro] = currentTick + 45
+                            notify("Stuck returning to car! Routing to next Camaro...", "CarFly", 3)
+                        else
+                            notify("Stuck returning! Re-ascending...", "CarFly", 3)
+                        end
+                        
+                        -- Reset states to immediately force re-ascension and clear the building/obstacle
+                        S.returnAscended = false
+                        S.returnAligned = false
+                    end
+                end
+                S.lastCheckedPos = currentPos
+            end
+
+            continue
+        end
+
+        -- Verify if the current target is still valid and has not become a prisoner
+        local targetValid = false
+        local targetPos = getTargetPos(S.targetPlayer)
+        local escaped = false
+        
+        if S.targetPlayer and S.targetPlayer.Parent and S.targetPlayer.Character and targetPos then
+            pcall(function()
+                -- It must explicitly evaluate as true to remain targeted
+                if S.targetPlayer:GetAttribute("HasEscaped") == true then
+                    escaped = true
+                end
+            end)
+            if escaped then
+                targetValid = true
+            end
+        end
+        
+        -- High Speed dropping (ONLY drops active targets if we are NOT currently in the arrest phase)
+        if targetValid and S.filterBySpeed and not S.isArresting then
+            pcall(function()
+                local root = S.targetPlayer.Character:FindFirstChild("HumanoidRootPart") or S.targetPlayer.Character.PrimaryPart
+                local vel = root and (root.AssemblyLinearVelocity or root.Velocity)
+                if vel then
+                    local speed = math.sqrt(vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z)
+                    local maxSpeed = tonumber(S.maxTargetSpeedStuds) or 80
+                    if speed > maxSpeed then
+                        targetValid = false
+                        notify("Target moving too fast! Dropping...", "CarFly", 3)
+                    end
+                end
+            end)
+        end
+
+        -- Acquire target if needed
+        if not targetValid then
+            forceReleaseE()
+            
+            -- Transition Event: If we just finished an arrest and are switching to Return-to-Car
+            if S.isArresting then
+                local alt = getNearbyAlternativeTarget(currentPos, 120, S.targetPlayer)
+                if alt then
+                    S.targetPlayer = alt
+                    S.isArresting = true -- Stay on foot and chain transition
+                    S.aligned = false
+                    
+                    S.lastDistanceToTarget = 999999999
+                    S.lastDistanceCheckTime = currentTick
+                    notify("Arrest complete! Chain targeting nearby: " .. alt.Name, "CarFly", 3)
+                    if S.targetLabel then
+                        S.targetLabel:SetText("Target: " .. alt.Name)
+                    end
+                else
+                    S.isArresting = false
+                    S.targetPlayer = nil
+                    S.isReturningToCar = true
+                    S.returnAscended = false
+                    S.returnAligned = false
+                    
+                    -- Reset distance monitoring locks to ensure a fresh clean state on the next target search
+                    S.lastDistanceToTarget = 999999999
+                    S.lastDistanceCheckTime = currentTick
+
+                    -- Equip slot 1 cleanly
+                    task.spawn(function()
+                        wait(0.1) -- Allow key release buffer to clear
+                        equipTool(1)
+                    end)
+                    if S.statusLabel then
+                        S.statusLabel:SetText("Status: Target Arrested/Lost! Returning to car...")
+                    end
+                end
+                continue
+            end
+
+            local foundPlayer = getNearestPlayer(currentPos)
+            if foundPlayer then
+                S.targetPlayer = foundPlayer
+                S.aligned = false 
+                
+                -- Initialize target tracking distance monitors to establish fresh benchmarks
+                S.lastDistanceToTarget = 999999999
+                S.lastDistanceCheckTime = currentTick
+
+                targetPos = getTargetPos(S.targetPlayer)
+                if targetPos then
+                    notify(string.format("Target: %s | Pos: %s", S.targetPlayer.Name, tostring(targetPos)), "CarFly", 3)
+                    if S.targetLabel then
+                        S.targetLabel:SetText("Target: " .. S.targetPlayer.Name)
+                    end
+                else
+                    S.targetPlayer = nil
+                end
+            else
+                S.targetPlayer = nil
+                if S.targetLabel then
+                    S.targetLabel:SetText("Target: Looking for players...")
+                end
+                if S.statusLabel then
+                    S.statusLabel:SetText("Status: Centering Map...")
+                end
+                
+                -- Idle Map Centering Logic (-100, activeHeight, -1400)
+                local centerPos = Vector3.new(-100, activeHeight, -1400)
+                local dx = centerPos.X - currentPos.X
+                local dz = centerPos.Z - currentPos.Z
+                local horizontalDistance = math.sqrt(dx * dx + dz * dz)
+                
+                local vxCent, vyCent, vzCent = 0, 0, 0
+                local speedH = car and activeCarSpeed or activePlayerSpeedH
+                local speedV = car and activeCarSpeed or activePlayerSpeedV
+                
+                if currentY < activeHeight then
+                    -- Ascend first
+                    vyCent = speedV
+                else
+                    if horizontalDistance > 10 then
+                        local flatDir = Vector3.new(dx, 0, dz).Unit
+                        vxCent = flatDir.X * speedH
+                        vzCent = flatDir.Z * speedH
+                        
+                        -- Minor height correction while traveling
+                        local heightDiff = activeHeight - currentY
+                        if math.abs(heightDiff) > 5 then
+                            vyCent = (heightDiff > 0 and 1 or -1) * 35
+                        end
+                    else
+                        -- Hover close to target altitude
+                        local heightDiff = activeHeight - currentY
+                        if math.abs(heightDiff) > 2 then
+                            vyCent = (heightDiff > 0 and 1 or -1) * 15
+                        end
+                    end
+                end
+                
+                if not S.isArresting and not S.isReturningToCar then
+                    if car and carPart then
+                        pcall(function()
+                            carPart.AssemblyLinearVelocity = Vector3.new(vxCent, vyCent, vzCent)
+                            carPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                        end)
+                    elseif myRoot then
+                        pcall(function()
+                            myRoot.AssemblyLinearVelocity = Vector3.new(vxCent, vyCent, vzCent)
+                            myRoot.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                        end)
+                    end
+                end
+                
+                continue
+            end
+        end
+
+        -- Verify target position again before physics computations
+        targetPos = getTargetPos(S.targetPlayer)
+        if not targetPos then continue end
+
+        -- Check if target player got too far away during pursuit (Algebraic Magnitude - completely avoids Vector2 constructor issues)
+        local tdx = targetPos.X - currentPos.X
+        local tdy = targetPos.Y - currentPos.Y
+        local tdz = targetPos.Z - currentPos.Z
+        local distanceToTarget = math.sqrt(tdx * tdx + tdy * tdy + tdz * tdz)
+        
+        -- Dynamic local evaluations from the pursuit range slider
+        local activeOnFootMax = tonumber(S.onFootMaxRange) or 50
+        local activeInCarMax = tonumber(S.inCarMaxRange) or 3500
+
+        -- On-foot escape safety boundary (Target ran away too fast while on foot)
+        if S.isArresting and distanceToTarget > activeOnFootMax then
+            -- Fetch target speed to see if they are genuinely faster than our horizontal glide speed limits
+            local targetSpeed = 0
+            pcall(function()
+                local targetChar = S.targetPlayer.Character
+                local root = targetChar and (targetChar:FindFirstChild("HumanoidRootPart") or targetChar.PrimaryPart)
+                local vel = root and (root.AssemblyLinearVelocity or root.Velocity)
+                if vel then
+                    targetSpeed = math.sqrt(vel.X * vel.X + vel.Y * vel.Y + vel.Z * vel.Z)
+                end
+            end)
+
+            -- ONLY give up on the chase if their current speed is faster than what our horizontal speed is set to
+            if targetSpeed > activePlayerSpeedH then
+                forceReleaseE()
+                S.isAimingTaser = false
+                
+                local alt = getNearbyAlternativeTarget(currentPos, 120, S.targetPlayer)
+                if alt then
+                    S.targetPlayer = alt
+                    S.isArresting = true
+                    S.aligned = false
+                    
+                    S.lastDistanceToTarget = 999999999
+                    S.lastDistanceCheckTime = currentTick
+                    notify("Target outran! Retargeting closer nearby: " .. alt.Name, "CarFly", 3)
+                    if S.targetLabel then
+                        S.targetLabel:SetText("Target: " .. alt.Name)
+                    end
+                else
+                    S.isArresting = false
+                    S.targetPlayer = nil
+                    S.isReturningToCar = true
+                    S.returnAscended = false
+                    S.returnAligned = false
+                    
+                    task.spawn(function()
+                        wait(0.1)
+                        equipTool(1)
+                    end)
+                    if S.statusLabel then
+                        S.statusLabel:SetText("Status: Target escaped! Returning to car...")
+                    end
+                end
+                continue
+            end
+        end
+
+        -- In-car pursuit limit (Target is too far across the map to realistically chase)
+        if not S.isArresting and distanceToTarget > activeInCarMax then
+            S.targetPlayer = nil
+            if S.statusLabel then
+                S.statusLabel:SetText("Status: Target too far! Finding closer criminal...")
+            end
+            continue
+        end
+
+        -- Target-Relative Progress Monitor (Unified for both in-car and on-foot phases with dynamic filters & numerical casting locks)
+        if S.targetPlayer and distanceToTarget > 6 then
+            local checkInterval = 1.0
+            local isArrestGraceActive = false
+            
+            if S.isArresting then
+                checkInterval = 3.0 -- Ordered 3.0 second grace timeline out of car
+                
+                -- Verify 3.0 second grace period upon transitioning to arrest phase
+                local phaseStart = tonumber(S.arrestPhaseStart) or 0
+                if currentTick - phaseStart < 3.0 then
+                    isArrestGraceActive = true
+                end
+            end
+            
+            local lastCheck = tonumber(S.lastDistanceCheckTime) or 0
+            if not isArrestGraceActive and (currentTick - lastCheck > checkInterval) then
+                local priorDist = tonumber(S.lastDistanceToTarget) or 999999999
+                
+                if priorDist < 999999999 then
+                    local deltaDistance = priorDist - distanceToTarget -- positive = getting closer, negative = moving away
+                    
+                    -- Evaluate minimum progression requirements
+                    local minRequiredProgress = S.isArresting and 2.0 or 1.5
+                    
+                    -- Prevent stuck/outran logic if actively sensing "arrest" or "eject" UI interaction prompts
+                    local actionText = getActionText()
+                    local activelyInteracting = actionText and (string.find(string.lower(actionText), "arrest") ~= nil or string.find(string.lower(actionText), "eject") ~= nil)
+                    
+                    if not activelyInteracting and deltaDistance < minRequiredProgress then
+                        local targetName = tostring(S.targetPlayer.Name)
+                        S.blacklistedPlayers[targetName] = currentTick + 15 -- Blacklist target for exactly 15 seconds
+                        notify("Blocked or Outrun! Retargeting " .. targetName, "CarFly", 3)
+                        
+                        -- Immediately break flight lock and search for a clear criminal
+                        forceReleaseE()
+                        S.isAimingTaser = false
+                        
+                        local alt = getNearbyAlternativeTarget(currentPos, 120, S.targetPlayer)
+                        if alt then
+                            S.targetPlayer = alt
+                            S.isArresting = true
+                            S.aligned = false
+                            S.ascended = false
+                            S.lastDistanceToTarget = 999999999
+                            S.lastDistanceCheckTime = currentTick
+                            if S.targetLabel then
+                                S.targetLabel:SetText("Target: " .. alt.Name)
+                            end
+                        else
+                            S.isArresting = false
+                            S.targetPlayer = nil
+                            S.aligned = false
+                            S.ascended = false
+                            S.lastDistanceToTarget = 999999999
+                            S.lastDistanceCheckTime = currentTick
+                            S.isReturningToCar = true
+                            S.returnAscended = false
+                            S.returnAligned = false
+                            
+                            task.spawn(function()
+                                wait(0.1)
+                                equipTool(1)
+                            end)
+                        end
+                        continue
+                    end
+                end
+                
+                S.lastDistanceToTarget = distanceToTarget
+                S.lastDistanceCheckTime = currentTick
+            end
+        end
+
+        -- Vertical Ceiling/Roof Stuck Detector (Safe numerical casting applied)
+        if S.targetPlayer then
+            local flatDx = targetPos.X - currentPos.X
+            local flatDz = targetPos.Z - currentPos.Z
+            local flatDist = math.sqrt(flatDx * flatDx + flatDz * flatDz)
+            local yDiff = math.abs(targetPos.Y - currentPos.Y)
+            
+            if flatDist < 10 and yDiff > 4 then
+                if S.verticalStuckStart == 0 then
+                    S.verticalStuckStart = currentTick
+                else
+                    local stuckStart = tonumber(S.verticalStuckStart) or 0
+                    if currentTick - stuckStart > 3.0 then -- Blocked vertically by roof or ceiling for over 3 seconds
+                        local targetName = tostring(S.targetPlayer.Name)
+                        S.blacklistedPlayers[targetName] = currentTick + 20 -- Blacklist for 20 seconds
+                        notify("Roof/Ceiling Blocked! Retargeting " .. targetName, "CarFly", 3)
+                        
+                        forceReleaseE()
+                        S.isAimingTaser = false
+                        
+                        local alt = getNearbyAlternativeTarget(currentPos, 120, S.targetPlayer)
+                        if alt then
+                            S.targetPlayer = alt
+                            S.isArresting = true
+                            S.aligned = false
+                            S.ascended = false
+                            S.verticalStuckStart = 0
+                            if S.targetLabel then
+                                S.targetLabel:SetText("Target: " .. alt.Name)
+                            end
+                        else
+                            S.isArresting = false
+                            S.targetPlayer = nil
+                            S.aligned = false
+                            S.ascended = false
+                            S.verticalStuckStart = 0
+                            S.isReturningToCar = true
+                            S.returnAscended = false
+                            S.returnAligned = false
+                            
+                            task.spawn(function()
+                                wait(0.1)
+                                equipTool(1)
+                            end)
+                        end
+                        continue
+                    end
+                end
+            else
+                S.verticalStuckStart = 0
+            end
+        else
+            S.verticalStuckStart = 0
+        end
+
+        -- Check if we are close enough to start arresting/teleporting (Handles Tase-then-Cuff Flow natively)
+        if distanceToTarget <= 15 or S.isArresting then
+            
+            -- If this is the transition frame where we just entered the arrest phase
+            if not S.isArresting then
+                S.isArresting = true
+                S.arrestPhaseStart = currentTick -- Capture transition timestamp for the out-of-car grace period
+                if S.statusLabel then
+                    S.statusLabel:SetText("Status: Initiating Arrest...")
+                end
+
+                -- Run the keystroke sequence asynchronously with closures
+                task.spawn(function()
+                    if not S.holdingE then
+                        S.holdingE = true
+                        
+                        -- 1. Jump out of the car
+                        task.spawn(function() tapKey(0x20) end)
+                        wait(0.3) -- Settle delay to ensure character is fully out of seat
+
+                        -- Safety boundary
+                        if not S.isArresting or not S.enabled then S.holdingE = false return end
+
+                        -- TASER TOGGLE LOGIC
+                        if S.useTaser then
+                            -- 2. Pull out Taser (Key 3 via hotbar checker)
+                            equipTool(3)
+
+                            -- 3. Lock Aimbot onto target player's viewport coordinates
+                            S.isAimingTaser = true
+                            wait(0.2) -- Camera tracking align duration
+
+                            if not S.isArresting or not S.enabled then S.isAimingTaser = false S.holdingE = false return end
+
+                            -- 4. Shoot Taser (Left Mouse Press) while aiming
+                            clickMouse()
+                            wait(0.2) -- Let projectile simulation settle
+
+                            -- 5. Stop Aimbot Aiming Camera writes
+                            S.isAimingTaser = false
+                        end
+
+                        if S.statusLabel then
+                            S.statusLabel:SetText("Status: Arresting (Cuffs)...")
+                        end
+                        
+                        -- 6. Equip Cuffs (Slot 2 via hotbar checker)
+                        equipTool(2)
+                        wait(0.05) -- Brief pause before the hold begins
+                        
+                        -- Safety boundary
+                        if not S.isArresting or not S.enabled then S.holdingE = false return end
+                        
+                        -- 7. Hold E down continuously in 1-second intervals until target is prisoner
+                        while S.isArresting and S.enabled and S.holdingE do
+                            local actionText = getActionText()
+                            local isArrestOrEject = actionText and (string.find(string.lower(actionText), "arrest") ~= nil or string.find(string.lower(actionText), "eject") ~= nil)
+                            
+                            if isArrestOrEject then
+                                pcall(keypress, 0x45) -- Begin holding E
+                                
+                                -- Wait up to 1 second but cancel instantly if state, target, or prompt transitions
+                                local holdStart = tonumber(tick()) or 0
+                                while (tonumber(tick()) or 0) - holdStart < 1.0 do
+                                    wait(0.05)
+                                    if not S.isArresting or not S.enabled or not S.holdingE then
+                                        break
+                                    end
+                                    
+                                    local currentPrompt = getActionText()
+                                    local stillArresting = currentPrompt and (string.find(string.lower(currentPrompt), "arrest") ~= nil or string.find(string.lower(currentPrompt), "eject") ~= nil)
+                                    if not stillArresting then
+                                        break
+                                    end
+                                end
+                                
+                                pcall(keyrelease, 0x45) -- Release briefly to cycle
+                                wait(0.05)
+                            else
+                                -- Release E if prompt is missing/inactive and wait
+                                pcall(keyrelease, 0x45)
+                                wait(0.05)
+                            end
+                        end
+                    end
+                end)
+            end
+
+            -- Smooth proportional physics velocity flight to target player
+            if myRoot then
+                -- Target offset elevated 5 studs above criminal to prevent floor dragging
+                local adjustedTargetPos = targetPos + Vector3.new(0, 5, 0)
+                local direction = adjustedTargetPos - currentPos
+                local dist = math.sqrt(direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z)
+
+                if dist > 1.5 then
+                    local velocity = direction * 15
+                    
+                    -- Separate Horizontal and Vertical speed limits for proportional on-foot glide
+                    local hMag = math.sqrt(velocity.X * velocity.X + velocity.Z * velocity.Z)
+                    if hMag > activePlayerSpeedH then
+                        local ratio = activePlayerSpeedH / hMag
+                        velocity = Vector3.new(velocity.X * ratio, velocity.Y, velocity.Z * ratio)
+                    end
+                    if math.abs(velocity.Y) > activePlayerSpeedV then
+                        velocity = Vector3.new(velocity.X, (velocity.Y > 0 and 1 or -1) * activePlayerSpeedV, velocity.Z)
+                    end
+                    
+                    vx = velocity.X
+                    vy = velocity.Y
+                    vz = velocity.Z
+                else
+                    -- Hover directly on top of their head when reached (stabilization locks)
+                    local velocity = direction * 5
+                    vx = velocity.X
+                    vy = velocity.Y
+                    vz = velocity.Z
+                end
+
+                pcall(function()
+                    myRoot.AssemblyLinearVelocity = Vector3.new(vx, vy, vz)
+                    myRoot.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                end)
+            end
+        else
+            -- Normal Flight Handling (Moving the car)
+            if not S.ascended then
+                -- Phase 1: Go straight up to activeHeight
+                if S.statusLabel then
+                    S.statusLabel:SetText("Status: Ascending...")
+                end
+                if currentY < activeHeight then
+                    vy = activeCarSpeed
+                else
+                    S.ascended = true
+                end
+            else
+                local horizontalDistance = 0
+                if targetPos and currentPos then
+                    -- 2D Math implementation for alignment (avoids Vector2 mismatch crashes)
+                    local tdx = targetPos.X - currentPos.X
+                    local tdz = targetPos.Z - currentPos.Z
+                    horizontalDistance = math.sqrt(tdx * tdx + tdz * tdz)
+                end
+                horizontalDistance = tonumber(horizontalDistance) or 0
+
+                if not S.aligned then
+                    -- Phase 2: Horizontal flight keeping altitude locked to activeHeight
+                    if S.statusLabel then
+                        S.statusLabel:SetText("Status: Aligning over target...")
+                    end
+                    local flatDirection = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
+                    local flatDistance = flatDirection.Magnitude
+
+                    -- Highly responsive 2D flat alignment boundary (8 studs)
+                    if flatDistance > 8 then
+                        local velocity = flatDirection.Unit * activeCarSpeed
+                        vx = velocity.X
+                        vy = 0
+                        
+                        -- Maintain vertical height during flight over targets
+                        local heightDiff = activeHeight - currentY
+                        if math.abs(heightDiff) > 5 then
+                            vy = (heightDiff > 0 and 1 or -1) * 35
+                        end
+                        vz = velocity.Z
+                    else
+                        S.aligned = true
+                    end
+                else
+                    -- Phase 3: Descend straight down to the player's ground level
+                    if S.statusLabel then
+                        S.statusLabel:SetText("Status: Descending straight down...")
+                    end
+                    
+                    local horizDirection = Vector3.new(targetPos.X - currentPos.X, 0, targetPos.Z - currentPos.Z)
+                    local vertDirection = Vector3.new(0, targetPos.Y - currentPos.Y, 0)
+                    
+                    local horizMag = horizDirection and tonumber(horizDirection.Magnitude) or 0
+                    local vertMag = vertDirection and tonumber(vertDirection.Magnitude) or 0
+
+                    local horizVel = horizMag > 2 and (horizDirection.Unit * activeCarSpeed) or Vector3.new(0, 0, 0)
+                    local vertVel = vertMag > 5 and (vertDirection.Unit * (activeCarSpeed * 0.6)) or Vector3.new(0, 0, 0)
+                    
+                    local velocity = horizVel + vertVel
+                    vx = velocity.X
+                    vy = velocity.Y
+                    vz = velocity.Z
+
+                    -- If target moves more than 40 studs away, pull up and realign
+                    if horizontalDistance > 40 then
+                        S.aligned = false
+                    end
+                end
+            end
+
+            -- Run Position Stuck check (Triggered if vehicle stays stuck in place for 4.0 seconds - defensively cast)
+            local lastPos = tonumber(S.lastPosCheck) or 0
+            if currentTick - lastPos > 4.0 then -- Configured 4-second stuck window
+                S.lastPosCheck = currentTick
+                if S.lastCheckedPos then
+                    -- Native mathematical magnitude (eliminates Magnitude property crash)
+                    local moved = 999
+                    if S.lastCheckedPos and currentPos then
+                        pcall(function()
+                            local mX = currentPos.X - S.lastCheckedPos.X
+                            local mY = currentPos.Y - S.lastCheckedPos.Y
+                            local mZ = currentPos.Z - S.lastCheckedPos.Z
+                            moved = math.sqrt(mX * mX + mY * mY + mZ * mZ)
+                        end)
+                    end
+
+                    local applyingVelocity = (vx ~= 0 or vy ~= 0 or vz ~= 0)
+                    
+                    if applyingVelocity and moved < 5 then
+                        if S.targetPlayer then
+                            local targetName = tostring(S.targetPlayer.Name)
+                            S.blacklistedPlayers[targetName] = currentTick + 20 -- Blacklist for 20 seconds
+                            notify("Stuck! Blacklisting " .. targetName, "CarFly", 3)
+                        end
+                        
+                        -- Reset states to immediately break lock and ascend
+                        S.targetPlayer = nil
+                        S.aligned = false
+                        S.ascended = false
+                    end
+                end
+                S.lastCheckedPos = currentPos
+            end
+
+            -- Apply velocity to the root assembly part only if we are sitting in the car (prevents ghost flight)
+            if not S.isArresting and not S.isReturningToCar and carPart then
+                pcall(function()
+                    carPart.AssemblyLinearVelocity  = Vector3.new(vx, vy, vz)
+                    carPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                end)
+            end
+        end
+    end 
+end)
+
+notify("Press P to toggle menu, G to toggle flight", "CarFly Loaded", 4)
