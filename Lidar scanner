@@ -1,0 +1,199 @@
+local myId = tick()
+_G.lidarScannerActive = myId
+
+local modes = { "Circle", "Line", "Square", "Point" }
+local modeIdx = 1
+
+local sizes = {
+    { spread = 0.03, dotSize = 1.5, rays = 15 },
+    { spread = 0.08, dotSize = 2, rays = 25 },
+    { spread = 0.16, dotSize = 2.5, rays = 40 },
+    { spread = 0.28, dotSize = 3, rays = 60 }
+}
+local sizeIdx = 2
+
+local cfg = {
+    enabled = true,
+    lifeTime = 20,
+    maxPoints = 5000,
+    range = 1000
+}
+
+local points = {}
+local drawings = {}
+local lastR = false
+local lastQ = false
+
+local bg = Drawing.new("Square")
+bg.Filled = true
+bg.Color = Color3.fromRGB(0, 0, 0)
+bg.Position = Vector2.new(0, 0)
+bg.Size = Vector2.new(1920, 1080)
+bg.Visible = true
+bg.ZIndex = 1
+
+local function getDot(idx)
+    if not drawings[idx] then
+        local ok, d = pcall(Drawing.new, "Square")
+        if ok and d then
+            d.Filled = true
+            d.Color = Color3.fromRGB(255, 255, 255)
+            d.ZIndex = 2
+            drawings[idx] = d
+        else
+            return nil
+        end
+    end
+    return drawings[idx]
+end
+
+local function cleanOldPoints()
+    local now = tick()
+    local cutoff = now - cfg.lifeTime
+    local keep = 1
+    for i = 1, #points do
+        if points[i].t >= cutoff then
+            keep = i
+            break
+        end
+    end
+    if keep > 1 then
+        for _ = 1, keep - 1 do
+            table.remove(points, 1)
+        end
+    end
+    while #points > cfg.maxPoints do
+        table.remove(points, 1)
+    end
+end
+
+local function renderDots()
+    local now = tick()
+    local drawIdx = 0
+
+    for i = 1, #points do
+        local pt = points[i]
+        local age = now - pt.t
+        if age <= cfg.lifeTime then
+            local sp, onScreen = WorldToScreen(pt.world)
+            if onScreen then
+                local alpha = math.max(0, 1 - (age / cfg.lifeTime))
+                drawIdx = drawIdx + 1
+                local d = getDot(drawIdx)
+                if d then
+                    local dSize = pt.size or 2
+                    d.Position = Vector2.new(sp.X - (dSize / 2), sp.Y - (dSize / 2))
+                    d.Size = Vector2.new(dSize, dSize)
+                    d.Transparency = alpha
+                    d.Visible = true
+                end
+            end
+        end
+    end
+
+    for i = drawIdx + 1, #drawings do
+        local d = drawings[i]
+        if d then
+            d.Visible = false
+        end
+    end
+end
+
+task.spawn(function()
+    local rs = game:GetService("RunService")
+    local players = game:GetService("Players")
+    local ws = game:GetService("Workspace")
+
+    rs.RenderStepped:Connect(function()
+        if _G.lidarScannerActive ~= myId then
+            bg.Visible = false
+            bg:Remove()
+            for _, d in ipairs(drawings) do
+                d.Visible = false
+                d:Remove()
+            end
+            return
+        end
+
+        if not cfg.enabled then
+            bg.Visible = false
+            for _, d in ipairs(drawings) do
+                d.Visible = false
+            end
+            return
+        end
+
+        local isR = iskeypressed(0x52)
+        if isR and not lastR then
+            modeIdx = (modeIdx % #modes) + 1
+            notify("Scan Mode: " .. modes[modeIdx], "LIDAR", 1.5)
+        end
+        lastR = isR
+
+        local isQ = iskeypressed(0x51)
+        if isQ and not lastQ then
+            sizeIdx = (sizeIdx % #sizes) + 1
+            notify("Size: " .. tostring(sizeIdx) .. " / " .. tostring(#sizes), "LIDAR", 1.5)
+        end
+        lastQ = isQ
+
+        local cam = ws.CurrentCamera
+        if not cam then return end
+
+        bg.Size = cam.ViewportSize
+        bg.Visible = true
+
+        local lp = players.LocalPlayer
+        if lp and ismouse1pressed() then
+            local mouse = lp:GetMouse()
+            local mx = mouse.X
+            local my = mouse.Y
+            local vp = cam.ViewportSize
+            local fov = math.rad(cam.FieldOfView or 70)
+            local aspect = vp.X / vp.Y
+            local halfH = math.tan(fov / 2)
+            local halfW = halfH * aspect
+            local nx = (mx / vp.X) * 2 - 1
+            local ny = 1 - (my / vp.Y) * 2
+
+            local cf = cam.CFrame or CFrame.new(cam.Position)
+            local right = cf.RightVector
+            local up = cf.UpVector
+            local baseDir = (right * (nx * halfW) + up * (ny * halfH) + cf.LookVector).Unit
+            local origin = cam.Position
+            local now = tick()
+
+            local curSetting = sizes[sizeIdx]
+            local currentMode = modes[modeIdx]
+
+            for _ = 1, curSetting.rays do
+                local offset = Vector3.zero
+                if currentMode == "Circle" then
+                    local ang = math.random() * math.pi * 2
+                    local rad = math.sqrt(math.random()) * curSetting.spread
+                    offset = right * (math.cos(ang) * rad) + up * (math.sin(ang) * rad)
+                elseif currentMode == "Line" then
+                    local dist = (math.random() * 2 - 1) * curSetting.spread
+                    offset = right * dist
+                elseif currentMode == "Square" then
+                    local ox = (math.random() * 2 - 1) * curSetting.spread
+                    local oy = (math.random() * 2 - 1) * curSetting.spread
+                    offset = right * ox + up * oy
+                elseif currentMode == "Point" then
+                    local ox = (math.random() - 0.5) * (curSetting.spread * 0.15)
+                    local oy = (math.random() - 0.5) * (curSetting.spread * 0.15)
+                    offset = right * ox + up * oy
+                end
+
+                local dir = (baseDir + offset).Unit * cfg.range
+                local hit = ws:Raycast(origin, dir)
+                if hit and hit.Position then
+                    table.insert(points, { world = hit.Position, t = now, size = curSetting.dotSize })
+                end
+            end
+        end
+
+        cleanOldPoints()
+        renderDots()
+    end)
+end)
