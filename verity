@@ -1,8 +1,8 @@
 local VerityId = tick()
-_G.VeritySmiley = VerityId
+_G.VerityActive = VerityId
 
-if _G.VeritySmileyCleanup then
-    _G.VeritySmileyCleanup()
+if _G.VerityCleanup then
+    _G.VerityCleanup()
 end
 
 local Settings = {
@@ -14,6 +14,16 @@ local Settings = {
     Radius = 1.3,
     Transparency = 1,
     Thickness = 5.5
+}
+
+local BotSettings = {
+    Size = 16.0,
+    Speed = 28.0,
+    CollisionRadius = 2.4,
+    Name = "evil verity",
+    MaxRayDist = 18.0,
+    NumRays = 8,
+    RaysPerSec = 5
 }
 
 local Cache = {
@@ -28,7 +38,14 @@ local Counts = {
     Circles = 0
 }
 
-_G.VeritySmileyCleanup = function()
+local Cleanups = {}
+
+local function RegisterCleanup(obj)
+    table.insert(Cleanups, obj)
+    return obj
+end
+
+_G.VerityCleanup = function()
     for _, group in pairs(Cache) do
         for i = 1, #group do
             local item = group[i]
@@ -42,7 +59,31 @@ _G.VeritySmileyCleanup = function()
     end
     Cache = { Triangles = {}, Lines = {}, Circles = {} }
     Counts = { Triangles = 0, Lines = 0, Circles = 0 }
+
+    for i = 1, #Cleanups do
+        local item = Cleanups[i]
+        if item then
+            pcall(function()
+                item.Visible = false
+                item:Remove()
+            end)
+        end
+    end
+    Cleanups = {}
 end
+
+local HealthOffset = nil
+task.spawn(function()
+    local http = game:GetService("HttpService")
+    local ok, result = pcall(function()
+        local res = game:HttpGet("https://offsets.imtheo.lol/offsets.json")
+        local ret = http:JSONDecode(res)
+        return ret.Offsets
+    end)
+    if ok and result and result.Humanoid and result.Humanoid.Health then
+        HealthOffset = result.Humanoid.Health
+    end
+end)
 
 local function GetDrawing(type, index)
     local list = Cache[type]
@@ -57,7 +98,19 @@ local function GetDrawing(type, index)
     return list[index]
 end
 
-local function Render(cf, camPos)
+local function HideHeadDrawings()
+    for typeName, maxCount in pairs(Counts) do
+        local list = Cache[typeName]
+        for i = 1, maxCount do
+            if list[i] then
+                list[i].Visible = false
+            end
+        end
+        Counts[typeName] = 0
+    end
+end
+
+local function RenderHead(cf, camPos)
     local pos = cf.Position
     local look = cf.LookVector
     local right = cf.RightVector
@@ -382,35 +435,818 @@ local function Render(cf, camPos)
     Counts.Circles = circleCount
 end
 
+local btnBorder = RegisterCleanup(Drawing.new("Square"))
+btnBorder.Filled = true
+btnBorder.Color = Color3.fromRGB(80, 15, 20)
+btnBorder.Size = Vector2.new(154, 46)
+btnBorder.Position = Vector2.new(0, 0)
+btnBorder.ZIndex = 9
+btnBorder.Visible = true
+
+local btnBg = RegisterCleanup(Drawing.new("Square"))
+btnBg.Filled = true
+btnBg.Color = Color3.fromRGB(220, 35, 45)
+btnBg.Size = Vector2.new(150, 42)
+btnBg.Position = Vector2.new(0, 0)
+btnBg.ZIndex = 10
+btnBg.Visible = true
+
+local btnText = RegisterCleanup(Drawing.new("Text"))
+btnText.Text = "evil verity"
+btnText.Center = true
+btnText.Outline = true
+pcall(function() btnText.Font = Drawing.Fonts.SystemBold end)
+pcall(function() btnText.Size = 16 end)
+btnText.Color = Color3.fromRGB(255, 255, 255)
+btnText.Position = Vector2.new(0, 0)
+btnText.ZIndex = 11
+btnText.Visible = true
+
+local function UpdateButtonPosition(cam)
+    local vSize = (cam and cam.ViewportSize and cam.ViewportSize.X > 200) and cam.ViewportSize or Vector2.new(1920, 1080)
+    local bw, bh = 150, 42
+    local posX = vSize.X - bw - 40
+    local posY = vSize.Y - bh - 40
+
+    btnBorder.Position = Vector2.new(posX - 2, posY - 2)
+    btnBg.Position = Vector2.new(posX, posY)
+    btnText.Position = Vector2.new(posX + bw / 2, posY + 13)
+end
+
+local botActive = false
+local botPos = nil
+local smoothDir = Vector3.new(0, 0, 1)
+local chosenDir = Vector3.new(0, 0, 1)
+local traversalSide = 0
+local isWallFollowing = false
+local rayTimer = 0
+local rayDirs = {}
+local rayHits = {}
+local rayDists = {}
+
+local allCollidable = {}
+local nearbyObstacles = {}
+
+local animStage = "idle"
+local animStartTime = 0
+local ballPos = Vector3.new(0, 0, 0)
+local ballVel = Vector3.new(0, 0, 0)
+local ballPitch = 0
+local ballYaw = 0
+local crackStartTime = 0
+local explodeStartTime = 0
+local particlePool = {}
+
+for i = 1, 24 do
+    local dot = RegisterCleanup(Drawing.new("Circle"))
+    dot.Radius = 3.5
+    dot.Filled = true
+    dot.ZIndex = 8
+    dot.Visible = false
+    particlePool[i] = {
+        Dot = dot,
+        Pos = Vector3.new(0, 0, 0),
+        Vel = Vector3.new(0, 0, 0),
+        Color = (i % 2 == 0) and Color3.fromRGB(255, 230, 0) or Color3.fromRGB(240, 30, 40)
+    }
+end
+
+local crackDrawings = {}
+for i = 1, 8 do
+    local l = RegisterCleanup(Drawing.new("Line"))
+    l.Thickness = 2.5
+    l.Color = Color3.fromRGB(30, 10, 10)
+    l.ZIndex = 7
+    l.Visible = false
+    crackDrawings[i] = l
+end
+
+local crackText = RegisterCleanup(Drawing.new("Text"))
+crackText.Text = ""
+crackText.Center = true
+crackText.Outline = true
+pcall(function() crackText.Font = Drawing.Fonts.SystemBold end)
+pcall(function() crackText.Size = 22 end)
+crackText.Color = Color3.fromRGB(240, 30, 40)
+crackText.ZIndex = 8
+crackText.Visible = false
+
+local botImage = RegisterCleanup(Drawing.new("Image"))
+botImage.Size = Vector2.new(100, 100)
+botImage.ZIndex = 3
+botImage.Visible = false
+
+task.spawn(function()
+    local ok, data = pcall(function()
+        return game:HttpGet("https://files.catbox.moe/2snq0e.png")
+    end)
+    if ok and data then
+        botImage.Data = data
+    end
+end)
+
+local jumpscareImage = RegisterCleanup(Drawing.new("Image"))
+jumpscareImage.Position = Vector2.new(0, 0)
+jumpscareImage.Size = Vector2.new(1920, 1080)
+jumpscareImage.ZIndex = 100
+jumpscareImage.Visible = false
+
+local jumpscareActive = false
+local jumpscareEndTime = 0
+
+task.spawn(function()
+    local ok, data = pcall(function()
+        return game:HttpGet("https://files.catbox.moe/slhobc.png")
+    end)
+    if ok and data then
+        jumpscareImage.Data = data
+    end
+end)
+
+local botName = RegisterCleanup(Drawing.new("Text"))
+botName.Text = BotSettings.Name
+botName.Center = true
+botName.Outline = true
+pcall(function() botName.Font = Drawing.Fonts.SystemBold end)
+pcall(function() botName.Size = 18 end)
+botName.Color = Color3.fromRGB(255, 255, 255)
+botName.ZIndex = 4
+botName.Visible = false
+
+local function HideBot()
+    botImage.Visible = false
+    botName.Visible = false
+end
+
+local function HideAnimationDrawings()
+    crackText.Visible = false
+    for i = 1, #crackDrawings do
+        crackDrawings[i].Visible = false
+    end
+    for i = 1, #particlePool do
+        particlePool[i].Dot.Visible = false
+    end
+end
+
+local function InitObstacles(char)
+    local ws = game:GetService("Workspace")
+    local all = ws:GetDescendants()
+    local list = {}
+    for i = 1, #all do
+        local inst = all[i]
+        if inst:IsA("BasePart") and inst.CanCollide then
+            if not (char and inst:IsDescendantOf(char)) then
+                table.insert(list, inst)
+            end
+        end
+    end
+    allCollidable = list
+end
+
+local function RayBox(ox, oz, dx, dz, maxD, minX, maxX, minZ, maxZ)
+    local tmin = 0
+    local tmax = maxD
+
+    if math.abs(dx) > 0.0001 then
+        local tx1 = (minX - ox) / dx
+        local tx2 = (maxX - ox) / dx
+        if tx1 > tx2 then tx1, tx2 = tx2, tx1 end
+        if tx1 > tmin then tmin = tx1 end
+        if tx2 < tmax then tmax = tx2 end
+        if tmin > tmax then return false, maxD end
+    else
+        if ox < minX or ox > maxX then return false, maxD end
+    end
+
+    if math.abs(dz) > 0.0001 then
+        local tz1 = (minZ - oz) / dz
+        local tz2 = (maxZ - oz) / dz
+        if tz1 > tz2 then tz1, tz2 = tz2, tz1 end
+        if tz1 > tmin then tmin = tz1 end
+        if tz2 < tmax then tmax = tz2 end
+        if tmin > tmax then return false, maxD end
+    else
+        if oz < minZ or oz > maxZ then return false, maxD end
+    end
+
+    if tmin >= 0 and tmin <= maxD then
+        return true, tmin
+    end
+    return false, maxD
+end
+
+local function CastRay(origin, dir, maxDist)
+    local closest = maxDist
+    local hit = false
+
+    for i = 1, #nearbyObstacles do
+        local p = nearbyObstacles[i]
+        if p and p.Parent then
+            local okPos, pPos = pcall(function() return p.Position end)
+            local okSize, pSize = pcall(function() return p.Size end)
+            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
+                local pMinY = pPos.Y - (pSize.Y / 2)
+                local pMaxY = pPos.Y + (pSize.Y / 2)
+
+                if (origin.Y + 2.0) >= pMinY and (origin.Y - 2.0) <= pMaxY then
+                    local hX = pSize.X / 2
+                    local hZ = pSize.Z / 2
+                    local didHit, dist = RayBox(origin.X, origin.Z, dir.X, dir.Z, maxDist, pPos.X - hX, pPos.X + hX, pPos.Z - hZ, pPos.Z + hZ)
+                    if didHit and dist < closest and dist > 0.05 then
+                        closest = dist
+                        hit = true
+                    end
+                end
+            end
+        end
+    end
+    return hit, closest
+end
+
+local function GetGroundY(pos)
+    local highest = -99999
+    local found = false
+
+    for i = 1, #nearbyObstacles do
+        local p = nearbyObstacles[i]
+        if p and p.Parent then
+            local okPos, pPos = pcall(function() return p.Position end)
+            local okSize, pSize = pcall(function() return p.Size end)
+            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
+                local minX = pPos.X - (pSize.X / 2) - 0.5
+                local maxX = pPos.X + (pSize.X / 2) + 0.5
+                local minZ = pPos.Z - (pSize.Z / 2) - 0.5
+                local maxZ = pPos.Z + (pSize.Z / 2) + 0.5
+                local topY = pPos.Y + (pSize.Y / 2)
+
+                if pos.X >= minX and pos.X <= maxX and pos.Z >= minZ and pos.Z <= maxZ then
+                    if topY <= (pos.Y + 3.0) and topY >= (pos.Y - 15.0) then
+                        if topY > highest then
+                            highest = topY
+                            found = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return found and highest or nil
+end
+
+local function ResolveWalls(pos, radius, height)
+    local feetY = pos.Y - (height / 2)
+    local headY = pos.Y + (height / 2)
+
+    for i = 1, #nearbyObstacles do
+        local p = nearbyObstacles[i]
+        if p and p.Parent then
+            local okPos, pPos = pcall(function() return p.Position end)
+            local okSize, pSize = pcall(function() return p.Size end)
+            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
+                local pMinY = pPos.Y - (pSize.Y / 2)
+                local pMaxY = pPos.Y + (pSize.Y / 2)
+
+                if (pMaxY > feetY + 1.0) and (pMinY < headY - 1.0) then
+                    local hX = pSize.X / 2
+                    local hZ = pSize.Z / 2
+                    local minX = pPos.X - hX
+                    local maxX = pPos.X + hX
+                    local minZ = pPos.Z - hZ
+                    local maxZ = pPos.Z + hZ
+
+                    local cx = math.max(minX, math.min(pos.X, maxX))
+                    local cz = math.max(minZ, math.min(pos.Z, maxZ))
+
+                    local dx = pos.X - cx
+                    local dz = pos.Z - cz
+                    local distSq = dx * dx + dz * dz
+
+                    if distSq < (radius * radius) then
+                        local dist = math.sqrt(distSq)
+                        if dist > 0.001 then
+                            local push = radius - dist
+                            pos = Vector3.new(pos.X + (dx / dist) * push, pos.Y, pos.Z + (dz / dist) * push)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return pos
+end
+
+local function TriggerJumpscareAndKill()
+    jumpscareActive = true
+    jumpscareEndTime = tick() + 2.0
+    botActive = false
+    animStage = "idle"
+    HideBot()
+    HideHeadDrawings()
+    HideAnimationDrawings()
+
+    local lp = game:GetService("Players").LocalPlayer
+    local char = lp and lp.Character
+    if char then
+        pcall(function()
+            if typeof(memory_write) == "function" and HealthOffset and char:FindFirstChild("Humanoid") then
+                local hum = char:FindFirstChild("Humanoid")
+                if hum.Address then
+                    memory_write("int", hum.Address + HealthOffset, 0)
+                end
+            end
+        end)
+        pcall(function()
+            if char:FindFirstChild("Humanoid") then
+                char.Humanoid.Health = 0
+            end
+        end)
+    end
+end
+
+local function StartSpawnSequence()
+    local lp = game:GetService("Players").LocalPlayer
+    local char = lp and lp.Character
+    local head = char and char:FindFirstChild("Head")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not head or not root then return end
+
+    InitObstacles(char)
+
+    ballPos = head.Position
+    local fwd = root.CFrame.LookVector
+    ballVel = Vector3.new(fwd.X * 14.0, 10.0, fwd.Z * 14.0)
+    ballPitch = 0
+    local _, yaw, _ = root.CFrame:ToOrientation()
+    ballYaw = yaw
+
+    animStage = "jumping"
+    animStartTime = tick()
+    botActive = false
+    HideBot()
+    HideHeadDrawings()
+    HideAnimationDrawings()
+end
+
+task.spawn(function()
+    while _G.VerityActive == VerityId do
+        local trackPos = (animStage ~= "idle" and ballPos) or botPos
+        if trackPos and typeof(trackPos) == "Vector3" then
+            local nearby = {}
+            for i = 1, #allCollidable do
+                local p = allCollidable[i]
+                if p and p.Parent then
+                    local okPos, pPos = pcall(function() return p.Position end)
+                    local okSize, pSize = pcall(function() return p.Size end)
+                    if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
+                        local diff = pPos - trackPos
+                        local maxExt = pSize.Magnitude / 2
+                        if diff.Magnitude < (40.0 + maxExt) then
+                            table.insert(nearby, p)
+                        end
+                    end
+                end
+            end
+            nearbyObstacles = nearby
+        end
+        wait(0.6)
+    end
+end)
+
+local function UpdateBot(dt, camPos, targetPos)
+    if not targetPos or not botPos or typeof(targetPos) ~= "Vector3" or typeof(botPos) ~= "Vector3" then return end
+
+    local toTarget = targetPos - botPos
+    local flatTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+    local distToTarget = flatTarget.Magnitude
+    local totalDist = toTarget.Magnitude
+
+    if totalDist <= 3.5 or distToTarget <= 2.2 then
+        TriggerJumpscareAndKill()
+        return
+    end
+
+    local torsoOrigin = Vector3.new(botPos.X, botPos.Y - (BotSettings.Size / 2) + 3.0, botPos.Z)
+    local desiredDir = (distToTarget > 0.001) and flatTarget.Unit or Vector3.new(0, 0, 1)
+    local perpRight = Vector3.new(desiredDir.Z, 0, -desiredDir.X)
+
+    rayTimer = rayTimer + dt
+    local interval = 1 / math.max(1, BotSettings.RaysPerSec)
+
+    if rayTimer >= interval then
+        rayTimer = rayTimer % interval
+
+        for i = 1, BotSettings.NumRays do
+            local angle = ((i - 1) / BotSettings.NumRays) * (math.pi * 2)
+            local dir = Vector3.new(math.cos(angle), 0, math.sin(angle)).Unit
+            local hit, dist = CastRay(torsoOrigin, dir, BotSettings.MaxRayDist)
+            rayDirs[i] = dir
+            rayHits[i] = hit
+            rayDists[i] = dist
+        end
+
+        local isDirectClear = true
+        for i = 1, BotSettings.NumRays do
+            if rayDirs[i] and rayDirs[i]:Dot(desiredDir) > 0.55 then
+                if rayHits[i] then
+                    isDirectClear = false
+                    break
+                end
+            end
+        end
+
+        if isDirectClear then
+            isWallFollowing = false
+            traversalSide = 0
+            chosenDir = desiredDir
+        else
+            if not isWallFollowing or traversalSide == 0 then
+                isWallFollowing = true
+                local leftScore = -999
+                local rightScore = -999
+
+                for i = 1, BotSettings.NumRays do
+                    if rayDirs[i] and not rayHits[i] then
+                        local sideFactor = rayDirs[i]:Dot(perpRight)
+                        local align = rayDirs[i]:Dot(desiredDir)
+                        if sideFactor < 0 and align > leftScore then
+                            leftScore = align
+                        elseif sideFactor > 0 and align > rightScore then
+                            rightScore = align
+                        end
+                    end
+                end
+                traversalSide = (leftScore >= rightScore) and 1 or -1
+            end
+
+            local bestScore = -999
+            local bestClearRay = nil
+
+            for i = 1, BotSettings.NumRays do
+                if rayDirs[i] and not rayHits[i] then
+                    local sideFactor = rayDirs[i]:Dot(perpRight)
+                    local sideSign = (sideFactor >= 0) and -1 or 1
+                    if sideSign == traversalSide then
+                        local score = rayDirs[i]:Dot(desiredDir)
+                        if score > bestScore then
+                            bestScore = score
+                            bestClearRay = rayDirs[i]
+                        end
+                    end
+                end
+            end
+
+            if not bestClearRay then
+                local maxD = -1
+                for i = 1, BotSettings.NumRays do
+                    if rayDirs[i] then
+                        local sideFactor = rayDirs[i]:Dot(perpRight)
+                        local sideSign = (sideFactor >= 0) and -1 or 1
+                        if sideSign == traversalSide and (rayDists[i] or 0) > maxD then
+                            maxD = rayDists[i]
+                            bestClearRay = rayDirs[i]
+                        end
+                    end
+                end
+            end
+
+            chosenDir = bestClearRay or desiredDir or Vector3.new(0, 0, 1)
+        end
+    end
+
+    smoothDir = (smoothDir and typeof(smoothDir) == "Vector3") and smoothDir or Vector3.new(0, 0, 1)
+    chosenDir = (chosenDir and typeof(chosenDir) == "Vector3") and chosenDir or Vector3.new(0, 0, 1)
+
+    local stepAlpha = math.min(1, dt * 10.0)
+    local diff = chosenDir - smoothDir
+    local lerped = smoothDir + (diff * stepAlpha)
+    smoothDir = (lerped.Magnitude > 0.001) and lerped.Unit or chosenDir
+
+    local newPos = botPos + (smoothDir * (BotSettings.Speed * dt))
+    newPos = ResolveWalls(newPos, BotSettings.CollisionRadius, BotSettings.Size)
+
+    local groundY = GetGroundY(newPos)
+    local halfH = BotSettings.Size / 2
+    if groundY then
+        local targetCenterY = groundY + halfH
+        newPos = Vector3.new(newPos.X, newPos.Y + (targetCenterY - newPos.Y) * math.min(1, dt * 12), newPos.Z)
+    else
+        newPos = Vector3.new(newPos.X, newPos.Y + (targetPos.Y - newPos.Y) * math.min(1, dt * 4), newPos.Z)
+    end
+
+    botPos = newPos
+
+    local lookHoriz = Vector3.new(camPos.X - botPos.X, 0, camPos.Z - botPos.Z)
+    lookHoriz = (lookHoriz.Magnitude > 0.001) and lookHoriz.Unit or Vector3.new(0, 0, 1)
+
+    local upDir = Vector3.new(0, 1, 0)
+    local rightDir = upDir:Cross(lookHoriz).Unit
+
+    local halfW = BotSettings.Size / 2
+
+    local wTL = botPos - (rightDir * halfW) + (upDir * halfH)
+    local wBR = botPos + (rightDir * halfW) - (upDir * halfH)
+    local wTop = botPos + (upDir * (halfH + 0.8))
+
+    local sTL, visTL = WorldToScreen(wTL)
+    local sBR, visBR = WorldToScreen(wBR)
+    local sTop, visTop = WorldToScreen(wTop)
+
+    if visTL and visBR then
+        local minX = math.min(sTL.X, sBR.X)
+        local minY = math.min(sTL.Y, sBR.Y)
+        local width = math.abs(sBR.X - sTL.X)
+        local height = math.abs(sBR.Y - sTL.Y)
+
+        botImage.Position = Vector2.new(minX, minY)
+        botImage.Size = Vector2.new(width, height)
+        botImage.Visible = true
+
+        if visTop then
+            botName.Position = Vector2.new(sTop.X, sTop.Y)
+            botName.Visible = true
+        else
+            botName.Visible = false
+        end
+    else
+        HideBot()
+    end
+end
+
+local function UpdateSpawnAnimation(dt, camPos)
+    local radius = Settings.Radius
+
+    if animStage == "jumping" then
+        ballVel = ballVel - Vector3.new(0, 32.0 * dt, 0)
+        local nextPos = ballPos + ballVel * dt
+        nextPos = ResolveWalls(nextPos, radius, radius * 2)
+
+        local groundY = GetGroundY(nextPos)
+        if groundY and (nextPos.Y - radius) <= groundY then
+            nextPos = Vector3.new(nextPos.X, groundY + radius, nextPos.Z)
+            if math.abs(ballVel.Y) > 4.0 then
+                ballVel = Vector3.new(ballVel.X * 0.45, -ballVel.Y * 0.35, ballVel.Z * 0.45)
+            else
+                ballVel = Vector3.new(0, 0, 0)
+                animStage = "cracking"
+                crackStartTime = tick()
+            end
+        end
+
+        ballPos = nextPos
+        ballPitch = ballPitch + dt * 10.0
+
+        local ballCF = CFrame.new(ballPos.X, ballPos.Y, ballPos.Z) * CFrame.fromOrientation(0, ballYaw, 0) * CFrame.Angles(ballPitch, 0, 0)
+        RenderHead(ballCF, camPos)
+
+    elseif animStage == "cracking" then
+        local elapsed = tick() - crackStartTime
+        local progress = math.min(1, elapsed / 3.0)
+
+        local shakeStrength = progress * 0.35
+        local shake = Vector3.new(math.sin(elapsed * 60.0) * shakeStrength, math.cos(elapsed * 55.0) * (shakeStrength * 0.5), math.cos(elapsed * 65.0) * shakeStrength)
+        local currentPos = ballPos + shake
+
+        local ballCF = CFrame.new(currentPos.X, currentPos.Y, currentPos.Z) * CFrame.fromOrientation(0, ballYaw, 0)
+        RenderHead(ballCF, camPos)
+
+        local fullRun = "Run..."
+        local letters = math.max(0, math.min(#fullRun, math.floor(progress * (#fullRun + 1))))
+        crackText.Text = string.sub(fullRun, 1, letters)
+
+        local topPos = currentPos + Vector3.new(0, radius + 1.2, 0)
+        local sTop, vTop = WorldToScreen(topPos)
+        if vTop and #crackText.Text > 0 then
+            crackText.Position = Vector2.new(sTop.X, sTop.Y)
+            crackText.Visible = true
+        else
+            crackText.Visible = false
+        end
+
+        local crackAngles = { 0, 0.78, 1.57, 2.35, 3.14, 3.92, 4.71, 5.49 }
+        for i = 1, 8 do
+            local line = crackDrawings[i]
+            local angle = crackAngles[i] + math.sin(elapsed * 20.0 + i) * 0.1
+            local reach = radius * 0.95 * progress
+            local p1w = currentPos
+            local p2w = currentPos + Vector3.new(math.cos(angle) * reach, math.sin(angle * 1.5) * reach * 0.6, math.sin(angle) * reach)
+
+            local s1, v1 = WorldToScreen(p1w)
+            local s2, v2 = WorldToScreen(p2w)
+
+            if v1 and v2 then
+                line.From = Vector2.new(s1.X, s1.Y)
+                line.To = Vector2.new(s2.X, s2.Y)
+                line.Color = (i % 2 == 0) and Color3.fromRGB(20, 10, 10) or Color3.fromRGB(220, 20, 20)
+                line.Visible = true
+            else
+                line.Visible = false
+            end
+        end
+
+        if elapsed >= 3.0 then
+            HideHeadDrawings()
+            crackText.Visible = false
+            animStage = "exploding"
+            explodeStartTime = tick()
+            for i = 1, 24 do
+                local ang1 = (i / 24) * math.pi * 2
+                local ang2 = (i % 6) * (math.pi / 3) - (math.pi / 6)
+                local speed = 12.0 + (i % 7) * 3.5
+                local dir = Vector3.new(math.cos(ang1) * math.cos(ang2), math.sin(ang2) + 0.6, math.sin(ang1) * math.cos(ang2)).Unit
+                particlePool[i].Pos = ballPos
+                particlePool[i].Vel = dir * speed
+            end
+            for i = 1, #crackDrawings do
+                crackDrawings[i].Visible = false
+            end
+        end
+
+    elseif animStage == "exploding" then
+        HideHeadDrawings()
+        crackText.Visible = false
+        local elapsed = tick() - explodeStartTime
+        local growth = math.min(1, elapsed / 0.75)
+        local curScale = (1 - math.cos(growth * math.pi)) * 0.5 * BotSettings.Size
+
+        for i = 1, 24 do
+            local p = particlePool[i]
+            p.Vel = p.Vel - Vector3.new(0, 25.0 * dt, 0)
+            p.Pos = p.Pos + p.Vel * dt
+
+            local sPos, onScreen = WorldToScreen(p.Pos)
+            if onScreen and growth < 0.95 then
+                p.Dot.Position = Vector2.new(sPos.X, sPos.Y)
+                p.Dot.Color = p.Color
+                p.Dot.Visible = true
+            else
+                p.Dot.Visible = false
+            end
+        end
+
+        local lookHoriz = Vector3.new(camPos.X - ballPos.X, 0, camPos.Z - ballPos.Z)
+        lookHoriz = (lookHoriz.Magnitude > 0.001) and lookHoriz.Unit or Vector3.new(0, 0, 1)
+        local upDir = Vector3.new(0, 1, 0)
+        local rightDir = upDir:Cross(lookHoriz).Unit
+
+        local halfW = curScale / 2
+        local halfH = curScale / 2
+
+        local wTL = ballPos - (rightDir * halfW) + (upDir * halfH)
+        local wBR = ballPos + (rightDir * halfW) - (upDir * halfH)
+
+        local sTL, visTL = WorldToScreen(wTL)
+        local sBR, visBR = WorldToScreen(wBR)
+
+        if visTL and visBR and curScale > 0.5 then
+            local minX = math.min(sTL.X, sBR.X)
+            local minY = math.min(sTL.Y, sBR.Y)
+            local width = math.abs(sBR.X - sTL.X)
+            local height = math.abs(sBR.Y - sTL.Y)
+
+            botImage.Position = Vector2.new(minX, minY)
+            botImage.Size = Vector2.new(width, height)
+            botImage.Visible = true
+        else
+            botImage.Visible = false
+        end
+
+        if elapsed >= 0.75 then
+            animStage = "idle"
+            botPos = ballPos
+            smoothDir = Vector3.new(0, 0, 1)
+            chosenDir = Vector3.new(0, 0, 1)
+            traversalSide = 0
+            isWallFollowing = false
+            botActive = true
+            HideHeadDrawings()
+            HideAnimationDrawings()
+        end
+    end
+end
+
+local players = game:GetService("Players")
+
+local function TriggerButtonPress()
+    btnBg.Color = Color3.fromRGB(255, 60, 70)
+    StartSpawnSequence()
+    task.spawn(function()
+        wait(0.15)
+        btnBg.Color = Color3.fromRGB(220, 35, 45)
+    end)
+end
+
+local mouseState = { click = false, hold = false }
+
+local function CheckMouseInput()
+    local lp = players.LocalPlayer
+    local mouse = lp and lp:GetMouse()
+    if not mouse then return end
+
+    local isDown = false
+    if typeof(iskeypressed) == "function" then
+        local ok, down = pcall(iskeypressed, 0x01)
+        if ok and down then
+            isDown = true
+        end
+    end
+
+    if isDown then
+        if not mouseState.hold and not mouseState.click then
+            mouseState.click = true
+        else
+            mouseState.click = false
+        end
+        mouseState.hold = true
+    else
+        mouseState.hold = false
+        mouseState.click = false
+    end
+
+    if mouseState.click then
+        local mx = mouse.X
+        local my = mouse.Y
+        local bx = btnBg.Position.X
+        local by = btnBg.Position.Y
+        local bw = btnBg.Size.X
+        local bh = btnBg.Size.Y
+
+        if mx >= bx and mx <= (bx + bw) and my >= by and my <= (by + bh) then
+            TriggerButtonPress()
+        end
+    end
+end
+
+local uis = game:GetService("UserInputService")
+uis.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        local lp = players.LocalPlayer
+        local mouse = lp and lp:GetMouse()
+        local mx = mouse and mouse.X or (input.Position and input.Position.X or 0)
+        local my = mouse and mouse.Y or (input.Position and input.Position.Y or 0)
+
+        local bx = btnBg.Position.X
+        local by = btnBg.Position.Y
+        local bw = btnBg.Size.X
+        local bh = btnBg.Size.Y
+
+        if mx >= bx and mx <= (bx + bw) and my >= by and my <= (by + bh) then
+            TriggerButtonPress()
+        end
+    end
+end)
+
 task.spawn(function()
     local RunService = game:GetService("RunService")
-    local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
 
-    RunService.RenderStepped:Connect(function()
-        if _G.VeritySmiley ~= VerityId then return end
+    RunService.RenderStepped:Connect(function(dt)
+        if _G.VerityActive ~= VerityId then return end
+
+        local camera = Workspace.CurrentCamera
+        UpdateButtonPosition(camera)
+        CheckMouseInput()
+
+        if jumpscareActive then
+            if tick() < jumpscareEndTime then
+                local vSize = (camera and camera.ViewportSize and camera.ViewportSize.X > 200) and camera.ViewportSize or Vector2.new(1920, 1080)
+                jumpscareImage.Position = Vector2.new(0, 0)
+                jumpscareImage.Size = vSize
+                jumpscareImage.Visible = true
+            else
+                jumpscareActive = false
+                jumpscareImage.Visible = false
+            end
+        else
+            jumpscareImage.Visible = false
+        end
 
         if not Settings.Enabled then
-            for type, max in pairs(Counts) do
-                local list = Cache[type]
-                for i = 1, max do
-                    if list[i] then list[i].Visible = false end
-                end
-                Counts[type] = 0
-            end
+            HideHeadDrawings()
+            HideBot()
+            HideAnimationDrawings()
             return
         end
 
-        local lp = Players.LocalPlayer
-        if not lp then return end
-        local character = lp.Character
-        if not character then return end
-        local head = character:FindFirstChild("Head")
-        if not head then return end
+        local lp = players.LocalPlayer
+        local character = lp and lp.Character
+        local head = character and character:FindFirstChild("Head")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local camPos = (camera and camera.Position and typeof(camera.Position) == "Vector3") and camera.Position or (head and head.Position or Vector3.new(0, 0, 0))
 
-        local camera = Workspace.CurrentCamera
-        local camPos = camera and camera.Position or head.Position
+        if animStage ~= "idle" then
+            UpdateSpawnAnimation(dt, camPos)
+        elseif not botActive and head then
+            RenderHead(head.CFrame, camPos)
+        else
+            HideHeadDrawings()
+        end
 
-        Render(head.CFrame, camPos)
+        if botActive and botPos and root and typeof(botPos) == "Vector3" and typeof(root.Position) == "Vector3" then
+            HideHeadDrawings()
+            UpdateBot(dt, camPos, root.Position)
+        elseif animStage == "idle" and not botActive then
+            HideBot()
+            HideAnimationDrawings()
+        end
     end)
 end)
