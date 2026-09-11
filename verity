@@ -473,6 +473,143 @@ local function UpdateButtonPosition(cam)
     btnText.Position = Vector2.new(posX + bw / 2, posY + 13)
 end
 
+local function FindPlayerFolder(ws)
+    local ok, res = pcall(function()
+        local wsPlayers = ws:FindFirstChild("Players")
+        if not wsPlayers then
+            local gameFolder = ws:FindFirstChild("Game")
+            if gameFolder then
+                wsPlayers = gameFolder:FindFirstChild("Players")
+            end
+        end
+        return wsPlayers
+    end)
+    return ok and res or nil
+end
+
+local function FindPlayerModel(folder, lp)
+    if not folder or not lp then return nil end
+    local m = folder:FindFirstChild(lp.Name)
+    if not m and lp.DisplayName then
+        m = folder:FindFirstChild(lp.DisplayName)
+    end
+    if not m then
+        local children = folder:GetChildren()
+        for i = 1, #children do
+            if string.lower(children[i].Name) == string.lower(lp.Name) then
+                return children[i]
+            end
+        end
+    end
+    return m
+end
+
+local CachedPlayerInfo = nil
+local LastPlayerInfoCheck = 0
+
+local function GetPlayerInfo()
+    local now = tick()
+    if CachedPlayerInfo and (now - LastPlayerInfoCheck < 0.25) then
+        local anchorPart = CachedPlayerInfo.Anchor
+        if anchorPart and anchorPart.Parent then
+            local pos = anchorPart.Position
+            local cf = anchorPart.CFrame
+            if CachedPlayerInfo.IsOffset then
+                pos = Vector3.new(pos.X, pos.Y + 2.7, pos.Z)
+                local okC, r00, r01, r02, r10, r11, r12, r20, r21, r22 = pcall(function()
+                    local _, _, _, a, b, c, d, e, f, g, h, i = anchorPart.CFrame:GetComponents()
+                    return a, b, c, d, e, f, g, h, i
+                end)
+                if okC and r00 then
+                    cf = CFrame.new(pos.X, pos.Y, pos.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+                else
+                    cf = CFrame.new(pos.X, pos.Y, pos.Z)
+                end
+            end
+            local _, yaw, _ = cf:ToOrientation()
+            CachedPlayerInfo.Position = pos
+            CachedPlayerInfo.CFrame = cf
+            CachedPlayerInfo.LookVector = cf.LookVector
+            CachedPlayerInfo.Yaw = yaw
+            return CachedPlayerInfo
+        end
+    end
+    LastPlayerInfoCheck = now
+
+    local lp = game:GetService("Players").LocalPlayer
+    if not lp then return nil end
+
+    local okP, pId = pcall(function() return game.PlaceId end)
+    local okG, gId = pcall(function() return game.GameId end)
+    local isSpecialPlace = ((okP and pId == 9872472334) or (okG and gId == 9872472334))
+
+    local char = nil
+    local anchorPart = nil
+
+    if isSpecialPlace then
+        local ws = game:GetService("Workspace")
+        local wsPlayers = FindPlayerFolder(ws)
+        if wsPlayers then
+            char = FindPlayerModel(wsPlayers, lp)
+        end
+        if not char then
+            char = lp.Character
+        end
+
+        if char then
+            local rightLeg = char:FindFirstChild("Right Leg") or char:FindFirstChild("RightLowerLeg")
+            if rightLeg then
+                anchorPart = rightLeg
+            else
+                anchorPart = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head") or char.PrimaryPart
+            end
+        end
+    else
+        char = lp.Character
+        if char then
+            anchorPart = char:FindFirstChild("Head")
+        end
+    end
+
+    if not char or not anchorPart then return nil end
+
+    local root = char:FindFirstChild("HumanoidRootPart") or anchorPart
+    local hum = char:FindFirstChildOfClass("Humanoid") or (char:FindFirstChild("Humanoid") and char.Humanoid)
+
+    local cf = anchorPart.CFrame
+    local pos = anchorPart.Position
+    local isOffset = isSpecialPlace and (anchorPart.Name == "Right Leg" or anchorPart.Name == "RightLowerLeg")
+
+    if isOffset then
+        pos = Vector3.new(pos.X, pos.Y + 2.7, pos.Z)
+        local okC, r00, r01, r02, r10, r11, r12, r20, r21, r22 = pcall(function()
+            local _, _, _, a, b, c, d, e, f, g, h, i = anchorPart.CFrame:GetComponents()
+            return a, b, c, d, e, f, g, h, i
+        end)
+        if okC and r00 then
+            cf = CFrame.new(pos.X, pos.Y, pos.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+        else
+            cf = CFrame.new(pos.X, pos.Y, pos.Z)
+        end
+    end
+
+    local _, yaw, _ = cf:ToOrientation()
+    local look = cf.LookVector
+
+    CachedPlayerInfo = {
+        Character = char,
+        Anchor = anchorPart,
+        Root = root,
+        Humanoid = hum,
+        CFrame = cf,
+        Position = pos,
+        LookVector = look,
+        Yaw = yaw,
+        IsOffset = isOffset
+    }
+    return CachedPlayerInfo
+end
+
 local botActive = false
 local botPos = nil
 local smoothDir = Vector3.new(0, 0, 1)
@@ -495,6 +632,7 @@ local ballPitch = 0
 local ballYaw = 0
 local crackStartTime = 0
 local explodeStartTime = 0
+local floorFallbackY = nil
 local particlePool = {}
 
 for i = 1, 24 do
@@ -588,19 +726,51 @@ local function HideAnimationDrawings()
     end
 end
 
+-- Fast shallow obstacle scanner (prevents freeze/crash from GetDescendants)
 local function InitObstacles(char)
-    local ws = game:GetService("Workspace")
-    local all = ws:GetDescendants()
     local list = {}
-    for i = 1, #all do
-        local inst = all[i]
-        if inst:IsA("BasePart") and inst.CanCollide then
-            if not (char and inst:IsDescendantOf(char)) then
-                table.insert(list, inst)
+    local ws = game:GetService("Workspace")
+    local ok, children = pcall(function() return ws:GetChildren() end)
+    if not ok or not children then return end
+
+    for i = 1, #children do
+        local child = children[i]
+        if child ~= char and child.Name ~= "Players" and child.Name ~= "Camera" then
+            if child:IsA("BasePart") and child.CanCollide then
+                table.insert(list, child)
+            elseif child:IsA("Model") or child:IsA("Folder") then
+                local sub = child:GetChildren()
+                for j = 1, math.min(#sub, 80) do
+                    local sc = sub[j]
+                    if sc:IsA("BasePart") and sc.CanCollide and not (char and sc:IsDescendantOf(char)) then
+                        table.insert(list, sc)
+                    end
+                end
             end
         end
     end
     allCollidable = list
+end
+
+local function UpdateNearbyObstacles(trackPos)
+    if not trackPos or typeof(trackPos) ~= "Vector3" then return end
+    local nearby = {}
+    local count = 0
+    for i = 1, #allCollidable do
+        local p = allCollidable[i]
+        if p and p.Parent then
+            local pPos = p.Position
+            local pSize = p.Size
+            local diff = pPos - trackPos
+            local maxExt = pSize.Magnitude / 2
+            if diff.Magnitude < (40.0 + maxExt) then
+                count = count + 1
+                nearby[count] = p
+                if count >= 50 then break end
+            end
+        end
+    end
+    nearbyObstacles = nearby
 end
 
 local function RayBox(ox, oz, dx, dz, maxD, minX, maxX, minZ, maxZ)
@@ -642,20 +812,18 @@ local function CastRay(origin, dir, maxDist)
     for i = 1, #nearbyObstacles do
         local p = nearbyObstacles[i]
         if p and p.Parent then
-            local okPos, pPos = pcall(function() return p.Position end)
-            local okSize, pSize = pcall(function() return p.Size end)
-            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
-                local pMinY = pPos.Y - (pSize.Y / 2)
-                local pMaxY = pPos.Y + (pSize.Y / 2)
+            local pPos = p.Position
+            local pSize = p.Size
+            local pMinY = pPos.Y - (pSize.Y / 2)
+            local pMaxY = pPos.Y + (pSize.Y / 2)
 
-                if (origin.Y + 2.0) >= pMinY and (origin.Y - 2.0) <= pMaxY then
-                    local hX = pSize.X / 2
-                    local hZ = pSize.Z / 2
-                    local didHit, dist = RayBox(origin.X, origin.Z, dir.X, dir.Z, maxDist, pPos.X - hX, pPos.X + hX, pPos.Z - hZ, pPos.Z + hZ)
-                    if didHit and dist < closest and dist > 0.05 then
-                        closest = dist
-                        hit = true
-                    end
+            if (origin.Y + 2.0) >= pMinY and (origin.Y - 2.0) <= pMaxY then
+                local hX = pSize.X / 2
+                local hZ = pSize.Z / 2
+                local didHit, dist = RayBox(origin.X, origin.Z, dir.X, dir.Z, maxDist, pPos.X - hX, pPos.X + hX, pPos.Z - hZ, pPos.Z + hZ)
+                if didHit and dist < closest and dist > 0.05 then
+                    closest = dist
+                    hit = true
                 end
             end
         end
@@ -670,21 +838,19 @@ local function GetGroundY(pos)
     for i = 1, #nearbyObstacles do
         local p = nearbyObstacles[i]
         if p and p.Parent then
-            local okPos, pPos = pcall(function() return p.Position end)
-            local okSize, pSize = pcall(function() return p.Size end)
-            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
-                local minX = pPos.X - (pSize.X / 2) - 0.5
-                local maxX = pPos.X + (pSize.X / 2) + 0.5
-                local minZ = pPos.Z - (pSize.Z / 2) - 0.5
-                local maxZ = pPos.Z + (pSize.Z / 2) + 0.5
-                local topY = pPos.Y + (pSize.Y / 2)
+            local pPos = p.Position
+            local pSize = p.Size
+            local minX = pPos.X - (pSize.X / 2) - 0.5
+            local maxX = pPos.X + (pSize.X / 2) + 0.5
+            local minZ = pPos.Z - (pSize.Z / 2) - 0.5
+            local maxZ = pPos.Z + (pSize.Z / 2) + 0.5
+            local topY = pPos.Y + (pSize.Y / 2)
 
-                if pos.X >= minX and pos.X <= maxX and pos.Z >= minZ and pos.Z <= maxZ then
-                    if topY <= (pos.Y + 3.0) and topY >= (pos.Y - 15.0) then
-                        if topY > highest then
-                            highest = topY
-                            found = true
-                        end
+            if pos.X >= minX and pos.X <= maxX and pos.Z >= minZ and pos.Z <= maxZ then
+                if topY <= (pos.Y + 3.0) and topY >= (pos.Y - 15.0) then
+                    if topY > highest then
+                        highest = topY
+                        found = true
                     end
                 end
             end
@@ -700,39 +866,70 @@ local function ResolveWalls(pos, radius, height)
     for i = 1, #nearbyObstacles do
         local p = nearbyObstacles[i]
         if p and p.Parent then
-            local okPos, pPos = pcall(function() return p.Position end)
-            local okSize, pSize = pcall(function() return p.Size end)
-            if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
-                local pMinY = pPos.Y - (pSize.Y / 2)
-                local pMaxY = pPos.Y + (pSize.Y / 2)
+            local pPos = p.Position
+            local pSize = p.Size
+            local pMinY = pPos.Y - (pSize.Y / 2)
+            local pMaxY = pPos.Y + (pSize.Y / 2)
 
-                if (pMaxY > feetY + 1.0) and (pMinY < headY - 1.0) then
-                    local hX = pSize.X / 2
-                    local hZ = pSize.Z / 2
-                    local minX = pPos.X - hX
-                    local maxX = pPos.X + hX
-                    local minZ = pPos.Z - hZ
-                    local maxZ = pPos.Z + hZ
+            if (pMaxY > feetY + 1.0) and (pMinY < headY - 1.0) then
+                local hX = pSize.X / 2
+                local hZ = pSize.Z / 2
+                local minX = pPos.X - hX
+                local maxX = pPos.X + hX
+                local minZ = pPos.Z - hZ
+                local maxZ = pPos.Z + hZ
 
-                    local cx = math.max(minX, math.min(pos.X, maxX))
-                    local cz = math.max(minZ, math.min(pos.Z, maxZ))
+                local cx = math.max(minX, math.min(pos.X, maxX))
+                local cz = math.max(minZ, math.min(pos.Z, maxZ))
 
-                    local dx = pos.X - cx
-                    local dz = pos.Z - cz
-                    local distSq = dx * dx + dz * dz
+                local dx = pos.X - cx
+                local dz = pos.Z - cz
+                local distSq = dx * dx + dz * dz
 
-                    if distSq < (radius * radius) then
-                        local dist = math.sqrt(distSq)
-                        if dist > 0.001 then
-                            local push = radius - dist
-                            pos = Vector3.new(pos.X + (dx / dist) * push, pos.Y, pos.Z + (dz / dist) * push)
-                        end
+                if distSq < (radius * radius) then
+                    local dist = math.sqrt(distSq)
+                    if dist > 0.001 then
+                        local push = radius - dist
+                        pos = Vector3.new(pos.X + (dx / dist) * push, pos.Y, pos.Z + (dz / dist) * push)
                     end
                 end
             end
         end
     end
     return pos
+end
+
+local function Draw3DBillboardImage(worldPos, worldSize, camPos, nameText)
+    local toCam = camPos - worldPos
+    local dist = toCam.Magnitude
+    if dist < 0.2 then return end
+
+    local cam = game:GetService("Workspace").CurrentCamera
+    local vSize = (cam and cam.ViewportSize and cam.ViewportSize.X > 200) and cam.ViewportSize or Vector2.new(1920, 1080)
+    local fov = (cam and cam.FieldOfView and cam.FieldOfView > 10) and cam.FieldOfView or 70
+    local focalLength = (vSize.Y * 0.5) / math.tan(math.rad(fov * 0.5))
+
+    local sCenter, onScreen = WorldToScreen(worldPos)
+    local pixelSize = (worldSize / math.max(0.1, dist)) * focalLength
+    local halfSize = pixelSize * 0.5
+
+    if onScreen then
+        local posX = sCenter.X - halfSize
+        local posY = sCenter.Y - halfSize
+
+        botImage.Position = Vector2.new(posX, posY)
+        botImage.Size = Vector2.new(pixelSize, pixelSize)
+        botImage.Visible = true
+
+        if nameText then
+            botName.Position = Vector2.new(sCenter.X, posY - 20)
+            botName.Visible = true
+        else
+            botName.Visible = false
+        end
+    else
+        HideBot()
+    end
 end
 
 local function TriggerJumpscareAndKill()
@@ -744,8 +941,8 @@ local function TriggerJumpscareAndKill()
     HideHeadDrawings()
     HideAnimationDrawings()
 
-    local lp = game:GetService("Players").LocalPlayer
-    local char = lp and lp.Character
+    local info = GetPlayerInfo()
+    local char = info and info.Character or (game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer.Character)
     if char then
         pcall(function()
             if typeof(memory_write) == "function" and HealthOffset and char:FindFirstChild("Humanoid") then
@@ -763,21 +960,23 @@ local function TriggerJumpscareAndKill()
     end
 end
 
+local isSpawning = false
+
 local function StartSpawnSequence()
-    local lp = game:GetService("Players").LocalPlayer
-    local char = lp and lp.Character
-    local head = char and char:FindFirstChild("Head")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not head or not root then return end
+    local info = GetPlayerInfo()
+    if not info then return end
 
-    InitObstacles(char)
+    InitObstacles(info.Character)
+    ballPos = info.Position
+    UpdateNearbyObstacles(ballPos)
 
-    ballPos = head.Position
-    local fwd = root.CFrame.LookVector
+    local fwd = info.LookVector
     ballVel = Vector3.new(fwd.X * 14.0, 10.0, fwd.Z * 14.0)
     ballPitch = 0
-    local _, yaw, _ = root.CFrame:ToOrientation()
-    ballYaw = yaw
+    ballYaw = info.Yaw
+
+    local anchorY = info.Anchor and info.Anchor.Position.Y or (ballPos.Y - 2.7)
+    floorFallbackY = anchorY - 1.5
 
     animStage = "jumping"
     animStartTime = tick()
@@ -787,26 +986,25 @@ local function StartSpawnSequence()
     HideAnimationDrawings()
 end
 
+local function TriggerButtonPress()
+    if isSpawning or animStage ~= "idle" or botActive then return end
+    isSpawning = true
+    btnBg.Color = Color3.fromRGB(255, 60, 70)
+
+    pcall(StartSpawnSequence)
+
+    task.spawn(function()
+        wait(0.25)
+        btnBg.Color = Color3.fromRGB(220, 35, 45)
+        isSpawning = false
+    end)
+end
+
 task.spawn(function()
     while _G.VerityActive == VerityId do
         local trackPos = (animStage ~= "idle" and ballPos) or botPos
         if trackPos and typeof(trackPos) == "Vector3" then
-            local nearby = {}
-            for i = 1, #allCollidable do
-                local p = allCollidable[i]
-                if p and p.Parent then
-                    local okPos, pPos = pcall(function() return p.Position end)
-                    local okSize, pSize = pcall(function() return p.Size end)
-                    if okPos and okSize and typeof(pPos) == "Vector3" and typeof(pSize) == "Vector3" then
-                        local diff = pPos - trackPos
-                        local maxExt = pSize.Magnitude / 2
-                        if diff.Magnitude < (40.0 + maxExt) then
-                            table.insert(nearby, p)
-                        end
-                    end
-                end
-            end
-            nearbyObstacles = nearby
+            UpdateNearbyObstacles(trackPos)
         end
         wait(0.6)
     end
@@ -935,41 +1133,7 @@ local function UpdateBot(dt, camPos, targetPos)
 
     botPos = newPos
 
-    local lookHoriz = Vector3.new(camPos.X - botPos.X, 0, camPos.Z - botPos.Z)
-    lookHoriz = (lookHoriz.Magnitude > 0.001) and lookHoriz.Unit or Vector3.new(0, 0, 1)
-
-    local upDir = Vector3.new(0, 1, 0)
-    local rightDir = upDir:Cross(lookHoriz).Unit
-
-    local halfW = BotSettings.Size / 2
-
-    local wTL = botPos - (rightDir * halfW) + (upDir * halfH)
-    local wBR = botPos + (rightDir * halfW) - (upDir * halfH)
-    local wTop = botPos + (upDir * (halfH + 0.8))
-
-    local sTL, visTL = WorldToScreen(wTL)
-    local sBR, visBR = WorldToScreen(wBR)
-    local sTop, visTop = WorldToScreen(wTop)
-
-    if visTL and visBR then
-        local minX = math.min(sTL.X, sBR.X)
-        local minY = math.min(sTL.Y, sBR.Y)
-        local width = math.abs(sBR.X - sTL.X)
-        local height = math.abs(sBR.Y - sTL.Y)
-
-        botImage.Position = Vector2.new(minX, minY)
-        botImage.Size = Vector2.new(width, height)
-        botImage.Visible = true
-
-        if visTop then
-            botName.Position = Vector2.new(sTop.X, sTop.Y)
-            botName.Visible = true
-        else
-            botName.Visible = false
-        end
-    else
-        HideBot()
-    end
+    Draw3DBillboardImage(botPos, BotSettings.Size, camPos, true)
 end
 
 local function UpdateSpawnAnimation(dt, camPos)
@@ -980,7 +1144,7 @@ local function UpdateSpawnAnimation(dt, camPos)
         local nextPos = ballPos + ballVel * dt
         nextPos = ResolveWalls(nextPos, radius, radius * 2)
 
-        local groundY = GetGroundY(nextPos)
+        local groundY = GetGroundY(nextPos) or floorFallbackY
         if groundY and (nextPos.Y - radius) <= groundY then
             nextPos = Vector3.new(nextPos.X, groundY + radius, nextPos.Z)
             if math.abs(ballVel.Y) > 4.0 then
@@ -1083,31 +1247,10 @@ local function UpdateSpawnAnimation(dt, camPos)
             end
         end
 
-        local lookHoriz = Vector3.new(camPos.X - ballPos.X, 0, camPos.Z - ballPos.Z)
-        lookHoriz = (lookHoriz.Magnitude > 0.001) and lookHoriz.Unit or Vector3.new(0, 0, 1)
-        local upDir = Vector3.new(0, 1, 0)
-        local rightDir = upDir:Cross(lookHoriz).Unit
-
-        local halfW = curScale / 2
-        local halfH = curScale / 2
-
-        local wTL = ballPos - (rightDir * halfW) + (upDir * halfH)
-        local wBR = ballPos + (rightDir * halfW) - (upDir * halfH)
-
-        local sTL, visTL = WorldToScreen(wTL)
-        local sBR, visBR = WorldToScreen(wBR)
-
-        if visTL and visBR and curScale > 0.5 then
-            local minX = math.min(sTL.X, sBR.X)
-            local minY = math.min(sTL.Y, sBR.Y)
-            local width = math.abs(sBR.X - sTL.X)
-            local height = math.abs(sBR.Y - sTL.Y)
-
-            botImage.Position = Vector2.new(minX, minY)
-            botImage.Size = Vector2.new(width, height)
-            botImage.Visible = true
+        if curScale > 0.5 then
+            Draw3DBillboardImage(ballPos, curScale, camPos, false)
         else
-            botImage.Visible = false
+            HideBot()
         end
 
         if elapsed >= 0.75 then
@@ -1125,16 +1268,6 @@ local function UpdateSpawnAnimation(dt, camPos)
 end
 
 local players = game:GetService("Players")
-
-local function TriggerButtonPress()
-    btnBg.Color = Color3.fromRGB(255, 60, 70)
-    StartSpawnSequence()
-    task.spawn(function()
-        wait(0.15)
-        btnBg.Color = Color3.fromRGB(220, 35, 45)
-    end)
-end
-
 local mouseState = { click = false, hold = false }
 
 local function CheckMouseInput()
@@ -1144,10 +1277,7 @@ local function CheckMouseInput()
 
     local isDown = false
     if typeof(iskeypressed) == "function" then
-        local ok, down = pcall(iskeypressed, 0x01)
-        if ok and down then
-            isDown = true
-        end
+        isDown = iskeypressed(0x01)
     end
 
     if isDown then
@@ -1175,25 +1305,6 @@ local function CheckMouseInput()
         end
     end
 end
-
-local uis = game:GetService("UserInputService")
-uis.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        local lp = players.LocalPlayer
-        local mouse = lp and lp:GetMouse()
-        local mx = mouse and mouse.X or (input.Position and input.Position.X or 0)
-        local my = mouse and mouse.Y or (input.Position and input.Position.Y or 0)
-
-        local bx = btnBg.Position.X
-        local by = btnBg.Position.Y
-        local bw = btnBg.Size.X
-        local bh = btnBg.Size.Y
-
-        if mx >= bx and mx <= (bx + bw) and my >= by and my <= (by + bh) then
-            TriggerButtonPress()
-        end
-    end
-end)
 
 task.spawn(function()
     local RunService = game:GetService("RunService")
@@ -1227,23 +1338,20 @@ task.spawn(function()
             return
         end
 
-        local lp = players.LocalPlayer
-        local character = lp and lp.Character
-        local head = character and character:FindFirstChild("Head")
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        local camPos = (camera and camera.Position and typeof(camera.Position) == "Vector3") and camera.Position or (head and head.Position or Vector3.new(0, 0, 0))
+        local info = GetPlayerInfo()
+        local camPos = (camera and camera.Position and typeof(camera.Position) == "Vector3") and camera.Position or (info and info.Position or Vector3.new(0, 0, 0))
 
         if animStage ~= "idle" then
             UpdateSpawnAnimation(dt, camPos)
-        elseif not botActive and head then
-            RenderHead(head.CFrame, camPos)
+        elseif not botActive and info then
+            RenderHead(info.CFrame, camPos)
         else
             HideHeadDrawings()
         end
 
-        if botActive and botPos and root and typeof(botPos) == "Vector3" and typeof(root.Position) == "Vector3" then
+        if botActive and botPos and info and typeof(botPos) == "Vector3" and typeof(info.Position) == "Vector3" then
             HideHeadDrawings()
-            UpdateBot(dt, camPos, root.Position)
+            UpdateBot(dt, camPos, info.Position)
         elseif animStage == "idle" and not botActive then
             HideBot()
             HideAnimationDrawings()
