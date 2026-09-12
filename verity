@@ -16,16 +16,6 @@ local Settings = {
     Thickness = 5.5
 }
 
-local BotSettings = {
-    Size = 16.0,
-    Speed = 28.0,
-    CollisionRadius = 2.4,
-    Name = "evil verity",
-    MaxRayDist = 18.0,
-    NumRays = 8,
-    RaysPerSec = 5
-}
-
 local Cache = {
     Triangles = {},
     Lines = {},
