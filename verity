@@ -1,3 +1,6 @@
+-- Load NonUI Library
+local Non = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/NonUI/main/NonUI.lua"))() or NonUI
+
 local VerityId = tick()
 _G.VerityActive = VerityId
 
@@ -25,6 +28,31 @@ local BotSettings = {
     NumRays = 8,
     RaysPerSec = 5
 }
+
+-- NonUI Window Setup
+local Window = Non:CreateWindow({
+    Title = "verity",
+    Folder = "VerityConfig",
+    Theme = "Dark",
+    Size = { 600, 170 },
+    MinSize = { 600, 170 }
+})
+
+local MainSection = Window:Section({ Title = "Configuration" })
+local HomeTab = MainSection:Tab({ Title = "Settings", Icon = "settings" })
+
+HomeTab:Slider({
+    Title = "Bot Speed",
+    Min = 1,
+    Max = 300,
+    Default = math.floor(BotSettings.Speed),
+    Rounding = 0,
+    Callback = function(val)
+        BotSettings.Speed = tonumber(val) or 28.0
+    end
+})
+
+HomeTab:Select()
 
 local Cache = {
     Triangles = {},
@@ -726,7 +754,6 @@ local function HideAnimationDrawings()
     end
 end
 
--- Fast shallow obstacle scanner (prevents freeze/crash from GetDescendants)
 local function InitObstacles(char)
     local list = {}
     local ws = game:GetService("Workspace")
