@@ -1,0 +1,95 @@
+local registered = {}
+
+local function registerPlayer(playerModel)
+    local playerName = playerModel.Name
+    if not playerName or registered[playerName] then return end
+
+    local visuals = playerModel:FindFirstChild("Visuals")
+    if not visuals then return end
+
+    local root = visuals:FindFirstChild("HumanoidRootPart")
+        or visuals:FindFirstChild("LowerTorso")
+        or visuals:FindFirstChild("UpperTorso")
+        or visuals:FindFirstChildOfClass("Part")
+        or visuals:FindFirstChildOfClass("MeshPart")
+
+    if not root then return end
+
+    local head = visuals:FindFirstChild("Head") or root
+    local torso = visuals:FindFirstChild("UpperTorso") or visuals:FindFirstChild("LowerTorso") or root
+    local humanoid = visuals:FindFirstChildOfClass("Humanoid")
+
+    local handle = RegisterModel({
+        entry = visuals,
+
+        ShouldDraw = function()
+            return playerModel.Parent ~= nil and root.Parent ~= nil
+        end,
+
+        GetRoot = function()
+            return root
+        end,
+
+        GetHead = function()
+            return head
+        end,
+
+        GetTorso = function()
+            return torso
+        end,
+
+        GetHumanoid = function()
+            return humanoid
+        end,
+
+        GetDisplayName = function()
+            return playerName
+        end,
+
+        GetTool = function()
+            return "None"
+        end,
+    })
+
+    registered[playerName] = {
+        model = playerModel,
+        handle = handle,
+    }
+
+    print("Registered player: " .. playerName)
+end
+
+task.spawn(function()
+    local charactersFolder = nil
+
+    while true do
+        if not charactersFolder or charactersFolder.Parent == nil then
+            local static = workspace:FindFirstChild("_Static")
+            charactersFolder = static and static:FindFirstChild("Characters")
+        end
+
+        if charactersFolder then
+            for name, data in pairs(registered) do
+                if not data.model or data.model.Parent == nil then
+                    if data.handle and (type(data.handle) == "table" or typeof(data.handle) == "userdata") then
+                        if data.handle.Remove then pcall(function() data.handle:Remove() end) end
+                        if data.handle.Destroy then pcall(function() data.handle:Destroy() end) end
+                    end
+                    registered[name] = nil
+                end
+            end
+
+            local children = charactersFolder:GetChildren()
+            for _, child in ipairs(children) do
+                if child:IsA("Model") then
+                    local name = child.Name
+                    if not registered[name] or registered[name].model ~= child then
+                        registerPlayer(child)
+                    end
+                end
+            end
+        end
+
+        task.wait(2)
+    end
+end)
